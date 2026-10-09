@@ -1,0 +1,239 @@
+<Window x:Class="DataManager.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="轻量数据管理工具"
+        Width="1180"
+        Height="720"
+        MinWidth="760"
+        MinHeight="440"
+        Background="{StaticResource WindowBackgroundBrush}"
+        FontFamily="{StaticResource UiFont}"
+        TextOptions.TextFormattingMode="Display"
+        UseLayoutRounding="True"
+        WindowStartupLocation="CenterScreen">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- ================= 顶部工具栏 ================= -->
+        <Border Grid.Row="0"
+                Background="{StaticResource SurfaceBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid Margin="12,9">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                    <!-- 设置：齿轮图标按钮 -->
+                    <Button x:Name="BtnSettings"
+                            Content="&#xE713;"
+                            Click="OnOpenSettings"
+                            Padding="9,6"
+                            ToolTip="设置"
+                            Style="{StaticResource IconButton}" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button x:Name="BtnAddRow"
+                            Content="添加"
+                            Click="OnAddRow"
+                            Margin="0,0,8,0" />
+                    <Button x:Name="BtnAddTag"
+                            Content="添加标签"
+                            Click="OnAddTag"
+                            Margin="0,0,8,0" />
+                    <Button x:Name="BtnDeleteRows"
+                            Content="删除行"
+                            Style="{StaticResource DangerButton}"
+                            Click="OnDeleteRows"
+                            Margin="0,0,8,0" />
+                    <Button x:Name="BtnQuickQuery"
+                            Content="快捷查询"
+                            Style="{StaticResource PrimaryButton}"
+                            Click="OnQuickQuery"
+                            Margin="0,0,8,0"
+                            Visibility="Collapsed" />
+                    <Button x:Name="BtnClearFilter"
+                            Content="清除筛选"
+                            Click="OnClearFilter"
+                            Visibility="Collapsed" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ================= 主体 ================= -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="105" MinWidth="80" />
+                <ColumnDefinition Width="4" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- 左侧表目录 -->
+            <Border Grid.Column="0"
+                    Background="{StaticResource SidebarBrush}"
+                    BorderBrush="{StaticResource BorderBrush}"
+                    BorderThickness="0,0,1,0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <ListBox x:Name="TableList"
+                             Grid.Row="0"
+                             Style="{StaticResource PlainListBox}"
+                             SelectionChanged="OnTableSelected" />
+
+                    <TextBlock x:Name="TxtNoTables"
+                               Grid.Row="0"
+                               Text="点击齿轮建表"
+                               Foreground="{StaticResource TextFaintBrush}"
+                               FontSize="12"
+                               TextWrapping="Wrap"
+                               TextAlignment="Center"
+                               Margin="10,20,10,0"
+                               VerticalAlignment="Top"
+                               Visibility="Collapsed" />
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Column="1"
+                          Width="4"
+                          HorizontalAlignment="Stretch"
+                          Background="Transparent"
+                          ResizeBehavior="PreviousAndNext" />
+
+            <!-- 右侧表格区 -->
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- 当前表标题 -->
+                <Border Grid.Row="0"
+                        Background="{StaticResource SurfaceBrush}"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="12,4">
+                    <TextBlock x:Name="TxtCurrentTable"
+                               Text=""
+                               FontSize="13"
+                               FontWeight="SemiBold"
+                               Foreground="{StaticResource TextBrush}"
+                               VerticalAlignment="Center"
+                               TextTrimming="CharacterEllipsis" />
+                </Border>
+
+                <!-- 标签展示条 -->
+                <Border x:Name="TagBar"
+                        Grid.Row="1"
+                        Background="#F8FAFD"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="0,0,0,1"
+                        Padding="12,7"
+                        Visibility="Collapsed">
+                    <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Disabled">
+                        <ItemsControl x:Name="TagBarItems">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <WrapPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </Border>
+
+                <!-- 表格 -->
+                <DataGrid x:Name="Grid"
+                          Grid.Row="2"
+                          Margin="12,10,12,10"
+                          AutoGenerateColumns="False"
+                          CanUserAddRows="False"
+                          CanUserDeleteRows="False"
+                          CanUserResizeRows="False"
+                          SelectionMode="Extended"
+                          SelectionUnit="CellOrRowHeader"
+                          HeadersVisibility="All"
+                          RowHeaderWidth="48"
+                          GridLinesVisibility="All"
+                          RowHeight="30"
+                          ColumnHeaderHeight="38"
+                          EnableRowVirtualization="True"
+                          VirtualizingPanel.VirtualizationMode="Recycling"
+                          BeginningEdit="OnGridBeginningEdit"
+                          CellEditEnding="OnGridCellEditEnding"
+                          PreviewKeyDown="OnGridPreviewKeyDown"
+                          SelectionChanged="OnGridSelectionChanged"
+                          LoadingRow="OnGridLoadingRow"
+                          PreviewMouseRightButtonDown="OnGridRightButtonDown"
+                          ContextMenuOpening="OnGridContextMenuOpening">
+                    <DataGrid.ColumnHeaderStyle>
+                        <StaticResource ResourceKey="StretchColumnHeader" />
+                    </DataGrid.ColumnHeaderStyle>
+                    <DataGrid.RowHeaderStyle>
+                        <StaticResource ResourceKey="IndexRowHeader" />
+                    </DataGrid.RowHeaderStyle>
+                    <DataGrid.ContextMenu>
+                        <ContextMenu x:Name="CellMenu">
+                            <MenuItem x:Name="MenuAddTag"
+                                      Header="添加标签"
+                                      Click="OnAddTag" />
+                            <MenuItem x:Name="MenuRemoveTag"
+                                      Header="移除标签"
+                                      Visibility="Collapsed" />
+                            <Separator />
+                            <MenuItem Header="复制"
+                                      Click="OnMenuCopy" />
+                            <MenuItem Header="删除行"
+                                      Click="OnDeleteRows" />
+                        </ContextMenu>
+                    </DataGrid.ContextMenu>
+                </DataGrid>
+
+                <TextBlock x:Name="TxtEmptyHint"
+                           Grid.Row="2"
+                           Text="还没有数据。点击【添加】新增一行。"
+                           Foreground="{StaticResource TextFaintBrush}"
+                           FontSize="13"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           IsHitTestVisible="False"
+                           Visibility="Collapsed" />
+
+                <!-- 底部：行数统计 -->
+                <Border Grid.Row="3"
+                        Background="{StaticResource SurfaceBrush}"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="0,1,0,0"
+                        Padding="12,5">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="TxtFooter"
+                                   Grid.Column="0"
+                                   Style="{StaticResource HintText}"
+                                   Text=""
+                                   TextTrimming="CharacterEllipsis" />
+                        <TextBlock x:Name="TxtCellInfo"
+                                   Grid.Column="1"
+                                   Style="{StaticResource HintText}"
+                                   Text="" />
+                    </Grid>
+                </Border>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

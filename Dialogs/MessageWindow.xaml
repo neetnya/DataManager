@@ -1,0 +1,40 @@
+<Window x:Class="DataManager.Dialogs.MessageWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="提示"
+        MinWidth="360"
+        MaxWidth="560"
+        SizeToContent="WidthAndHeight"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Background="{StaticResource WindowBackgroundBrush}"
+        FontFamily="{StaticResource UiFont}">
+    <Border Padding="22,20,22,16">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0" Orientation="Horizontal">
+                <TextBlock x:Name="TxtIcon"
+                           FontSize="20"
+                           VerticalAlignment="Top"
+                           Margin="0,0,12,0" />
+                <TextBlock x:Name="TxtMessage"
+                           Foreground="{StaticResource TextBrush}"
+                           FontSize="13"
+                           TextWrapping="Wrap"
+                           MaxWidth="440"
+                           VerticalAlignment="Center" />
+            </StackPanel>
+
+            <StackPanel x:Name="Buttons"
+                        Grid.Row="1"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Margin="0,20,0,0" />
+        </Grid>
+    </Border>
+</Window>

@@ -1,0 +1,56 @@
+# Build script for DataManager
+# Usage: powershell -ExecutionPolicy Bypass -File .\build.ps1
+# Output goes to .\dist (framework-dependent, ~0.4 MB)
+#
+# NOTE: keep this file ASCII-only on purpose.
+# PowerShell 5.1 reads BOM-less .ps1 files as ANSI, which mangles non-ASCII
+# text and can merge lines, silently breaking logic below. ASCII avoids that
+# whole class of bug regardless of how the file is saved.
+
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$proj = Join-Path $root 'DataManager.csproj'
+$out  = Join-Path $root 'dist'
+
+if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    Write-Error 'need dotnet SDK 9.0'
+    exit 1
+}
+
+# dist also holds the user's real data (Data\data.sqlite, Backup\, config.json).
+# Only program files may be removed here. Never remove the whole directory.
+$userData = @('Data', 'Backup', 'config.json')
+
+if (Test-Path $out) {
+    $stale = Get-ChildItem -Force $out | Where-Object { $userData -notcontains $_.Name }
+    foreach ($item in $stale) {
+        Remove-Item $item.FullName -Recurse -Force
+    }
+}
+
+& dotnet publish $proj `
+    -c Release `
+    -f net9.0-windows `
+    --self-contained false `
+    -p:PublishSingleFile=false `
+    -o $out `
+    --nologo
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$exe = Join-Path $out 'DataManager.exe'
+if (-not (Test-Path $exe)) {
+    Write-Error 'DataManager.exe'
+    exit 1
+}
+
+# Post-flight check: the user's data must still be there after publishing.
+foreach ($item in $userData) {
+    $path = Join-Path $out $item
+    if (-not (Test-Path $path)) {
+        Write-Error "publish destroyed user data: $path"
+        exit 1
+    }
+}
+
+Write-Host $exe
