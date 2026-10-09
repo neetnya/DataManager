@@ -18,12 +18,21 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# dist also holds the user's real data (Data\data.sqlite, Backup\, config.json).
-# Only program files may be removed here. Never remove the whole directory.
-$userData = @('Data', 'Backup', 'config.json')
+# dist may also hold runtime data (Data\data.sqlite, Backup\, config.json).
+# If present, leave it alone; only program files are cleared here.
+# Note these are optional -- a fresh dist legitimately has none of them,
+# so remember what existed and verify afterwards that it survived.
+$runtimeData = @('Data', 'Backup', 'config.json')
+
+$presentBefore = @()
+foreach ($item in $runtimeData) {
+    if (Test-Path (Join-Path $out $item)) {
+        $presentBefore += $item
+    }
+}
 
 if (Test-Path $out) {
-    $stale = Get-ChildItem -Force $out | Where-Object { $userData -notcontains $_.Name }
+    $stale = Get-ChildItem -Force $out | Where-Object { $runtimeData -notcontains $_.Name }
     foreach ($item in $stale) {
         Remove-Item $item.FullName -Recurse -Force
     }
@@ -44,11 +53,13 @@ if (-not (Test-Path $exe)) {
     exit 1
 }
 
-# Post-flight check: the user's data must still be there after publishing.
-foreach ($item in $userData) {
+# Post-flight check: anything that existed before publishing must still exist.
+# Items that were absent before are expected to stay absent, so deleting them
+# yourself does not trip this check.
+foreach ($item in $presentBefore) {
     $path = Join-Path $out $item
     if (-not (Test-Path $path)) {
-        Write-Error "publish destroyed user data: $path"
+        Write-Error "publish removed runtime data: $path"
         exit 1
     }
 }
