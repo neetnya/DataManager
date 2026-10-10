@@ -63,9 +63,9 @@ namespace DataManager.Services
         /// </summary>
         public string GroupSeparator { get; set; } = "/";
 
-        // ---- 列宽记忆：表 Id → 物理列名 → 宽度 ----
+        // ---- 列宽记忆：表 Id → 物理列名 → 宽度比例（0~1） ----
 
-        /// <summary>用户手动调整过的列宽。</summary>
+        /// <summary>用户手动调整过的列宽（存占表格总宽度的比例，0~1）。</summary>
         public Dictionary<string, Dictionary<string, double>> ColumnWidths { get; set; }
             = new Dictionary<string, Dictionary<string, double>>();
 
@@ -137,7 +137,7 @@ namespace DataManager.Services
             WebDavFileName = null;
         }
 
-        /// <summary>记住某一列的宽度。</summary>
+        /// <summary>记住某一列的宽度比例（0~1，占表格总宽度）。</summary>
         public void SetColumnWidth(long tableId, string physicalName, double width)
         {
             string key = tableId.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -150,7 +150,7 @@ namespace DataManager.Services
             map[physicalName] = width;
         }
 
-        /// <summary>取某列记住的宽度；没有则返回 0。</summary>
+        /// <summary>取某列记住的宽度比例（0~1）；没有则返回 0。</summary>
         public double GetColumnWidth(long tableId, string physicalName)
         {
             string key = tableId.ToString(System.Globalization.CultureInfo.InvariantCulture);

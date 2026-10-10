@@ -168,10 +168,11 @@ namespace DataManager
 
         private DataGridColumn BuildColumn(AppColumn column)
         {
-            // 恢复用户上次调整过的列宽；没有记录时按星号均分
+            // 恢复用户上次调整过的列宽比例（0~1，Star 单位）；没有记录时按 1 Star 均分。
+            // 旧版存的是像素值（> 1），识别为无效，回退到均分。
             double saved = App.Settings.GetColumnWidth(_table.Id, column.PhysicalName);
-            DataGridLength width = saved > 0
-                ? new DataGridLength(saved)
+            DataGridLength width = saved > 0 && saved <= 1
+                ? new DataGridLength(saved, DataGridLengthUnitType.Star)
                 : new DataGridLength(1, DataGridLengthUnitType.Star);
 
             var col = new DataGridTemplateColumn
@@ -188,7 +189,7 @@ namespace DataManager
             return col;
         }
 
-        /// <summary>用户拖动列分隔线后记住列宽。</summary>
+        /// <summary>用户拖动列分隔线后，把整张表所有列的宽度比例一起落盘。</summary>
         private void OnColumnGripperDragCompleted(object sender, System.Windows.Controls.Primitives.DragCompletedEventArgs e)
         {
             if (_suppressWidthSave || _table == null)
@@ -201,34 +202,60 @@ namespace DataManager
                 return;
             }
 
-            // 找到这个 Thumb 属于哪个列头
+            // 找到这个 Thumb 属于哪个列头，确认是列宽拖动而非其他 Thumb
             var header = FindAncestor<System.Windows.Controls.Primitives.DataGridColumnHeader>(thumb);
             if (header == null || header.Column == null)
             {
                 return;
             }
 
-            var column = header.Column.GetValue(WidthHandlerProperty) as AppColumn;
-            if (column == null)
+            SaveAllColumnWidths();
+        }
+
+        /// <summary>把所有列当前宽度换算成比例（0~1）落盘，保证总和为 1。</summary>
+        private void SaveAllColumnWidths()
+        {
+            if (_table == null || Grid.Columns.Count == 0)
             {
                 return;
             }
 
-            double width = header.Column.ActualWidth;
-            if (width <= 0)
+            double total = 0;
+            foreach (DataGridColumn col in Grid.Columns)
+            {
+                total += col.ActualWidth;
+            }
+
+            if (total <= 0)
             {
                 return;
             }
 
-            double existing = App.Settings.GetColumnWidth(_table.Id, column.PhysicalName);
-            if (Math.Abs(existing - width) < 0.5)
+            bool changed = false;
+            foreach (DataGridColumn col in Grid.Columns)
             {
-                return;
+                var column = col.GetValue(WidthHandlerProperty) as AppColumn;
+                if (column == null)
+                {
+                    continue;
+                }
+
+                double ratio = col.ActualWidth / total;
+                double existing = App.Settings.GetColumnWidth(_table.Id, column.PhysicalName);
+                if (Math.Abs(existing - ratio) < 0.0001)
+                {
+                    continue;
+                }
+
+                App.Settings.SetColumnWidth(_table.Id, column.PhysicalName, ratio);
+                changed = true;
             }
 
-            App.Settings.SetColumnWidth(_table.Id, column.PhysicalName, width);
-            _widthDirty = true;
-            ScheduleWidthSave();
+            if (changed)
+            {
+                _widthDirty = true;
+                ScheduleWidthSave();
+            }
         }
 
         /// <summary>挂在列上、用于反查该列对应哪个 AppColumn 的附加属性。</summary>
@@ -886,6 +913,13 @@ namespace DataManager
                 if (e.Key == Key.V && !editing)
                 {
                     PasteAtSelection();
+                    e.Handled = true;
+                    return;
+                }
+
+                if (e.Key == Key.F && !editing && _table != null && _table.HasQuickQuery)
+                {
+                    OnQuickQuery(this, new RoutedEventArgs());
                     e.Handled = true;
                     return;
                 }
