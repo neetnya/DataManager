@@ -244,14 +244,14 @@ namespace DataManager
         {
             AppSettings s = App.Settings;
 
-            var family = new FontFamily(string.IsNullOrWhiteSpace(s.GridFontFamily)
-                ? "Microsoft YaHei UI"
-                : s.GridFontFamily);
+            var family = string.IsNullOrWhiteSpace(s.GridFontFamily)
+                ? (Application.Current.Resources["UiFont"] as FontFamily)
+                : new FontFamily(s.GridFontFamily);
 
             Grid.FontFamily = family;
             Grid.FontSize = s.GridFontSize > 0 ? s.GridFontSize : 13;
 
-            Grid.FontWeight = s.GridFontBold ? FontWeights.Bold : FontWeights.Normal;
+            Grid.FontWeight = s.GridFontBold ? FontWeights.SemiBold : FontWeights.Normal;
             Grid.FontStyle = s.GridFontItalic ? FontStyles.Italic : FontStyles.Normal;
 
             if (s.GridRowHeight > 0)

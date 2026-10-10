@@ -391,11 +391,11 @@ namespace DataManager
         {
             PreviewArea.Children.Clear();
 
-            var family = new FontFamily(string.IsNullOrWhiteSpace(App.Settings.GridFontFamily)
-                ? "Microsoft YaHei UI"
-                : App.Settings.GridFontFamily);
+            var family = string.IsNullOrWhiteSpace(App.Settings.GridFontFamily)
+                ? (Application.Current.Resources["UiFont"] as FontFamily)
+                : new FontFamily(App.Settings.GridFontFamily);
 
-            FontWeight weight = App.Settings.GridFontBold ? FontWeights.Bold : FontWeights.Normal;
+            FontWeight weight = App.Settings.GridFontBold ? FontWeights.SemiBold : FontWeights.Normal;
             FontStyle style = App.Settings.GridFontItalic ? FontStyles.Italic : FontStyles.Normal;
             double size = App.Settings.GridFontSize > 0 ? App.Settings.GridFontSize : 13;
             double rowHeight = App.Settings.GridRowHeight > 0 ? App.Settings.GridRowHeight : 30;

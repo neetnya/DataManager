@@ -8,7 +8,6 @@
         MinHeight="440"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}"
-        TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True"
         WindowStartupLocation="CenterScreen">
 
