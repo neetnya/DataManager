@@ -587,9 +587,29 @@ namespace DataManager
                             ? list
                             : new List<string>();
 
-                        if (groupTags.TryGetValue(GroupKey(c.Id, value), out List<Tag> gt))
+                        // 分组列可能一个单元格含多个分组值（按分隔符拆分），
+                        // 把每个分组值上挂的标签合并到一起展示。
+                        var collected = new List<Tag>();
+                        var seen = new HashSet<long>();
+                        foreach (string part in GroupValueSplitter.Split(value))
                         {
-                            cell.RefreshGroupTags(gt);
+                            if (!groupTags.TryGetValue(GroupKey(c.Id, part), out List<Tag> gt))
+                            {
+                                continue;
+                            }
+
+                            foreach (Tag t in gt)
+                            {
+                                if (seen.Add(t.Id))
+                                {
+                                    collected.Add(t);
+                                }
+                            }
+                        }
+
+                        if (collected.Count > 0)
+                        {
+                            cell.RefreshGroupTags(collected);
                         }
                     }
 
@@ -1378,9 +1398,13 @@ namespace DataManager
                         continue;
                     }
 
-                    if (groupTagIds.TryGetValue(GroupKey(c.Id, row.Cells[i].Value), out HashSet<long> viaGroup))
+                    // 分组列一个单元格可能含多个分组值，逐个拆分项命中
+                    foreach (string part in GroupValueSplitter.Split(row.Cells[i].Value))
                     {
-                        hit.UnionWith(viaGroup);
+                        if (groupTagIds.TryGetValue(GroupKey(c.Id, part), out HashSet<long> viaGroup))
+                        {
+                            hit.UnionWith(viaGroup);
+                        }
                     }
                 }
 
@@ -1620,7 +1644,7 @@ namespace DataManager
                 {
                     if (l.Scope == TagScope.GroupValue &&
                         l.ColumnId == column.Id &&
-                        string.Equals(l.GroupValue, value, StringComparison.Ordinal))
+                        GroupValueSplitter.Contains(value, l.GroupValue))
                     {
                         Data.Schema.UnlinkTag(l.Id);
                     }

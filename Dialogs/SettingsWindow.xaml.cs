@@ -248,6 +248,7 @@ namespace DataManager
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
             BuildAppearanceControls();
+            TxtGroupSeparator.Text = App.Settings.GroupSeparator ?? string.Empty;
             RefreshTableList();
             if (TableList.Items.Count > 0)
             {
@@ -342,6 +343,13 @@ namespace DataManager
         private void OnAppearanceChanged(object sender, RoutedEventArgs e)
         {
             ApplyAppearanceFromUi();
+        }
+
+        /// <summary>分组分隔符改动：立即写回内存配置并标记未保存。</summary>
+        private void OnGroupSeparatorChanged(object sender, TextChangedEventArgs e)
+        {
+            App.Settings.GroupSeparator = TxtGroupSeparator.Text ?? string.Empty;
+            MarkDirty();
         }
 
         private void ApplyAppearanceFromUi()

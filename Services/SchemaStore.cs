@@ -575,6 +575,26 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
 
         private bool GroupValueExists(long tableId, AppColumn groupColumn, string value)
         {
+            // 分组列：只要任一单元格按分隔符拆分后包含该值，即视为存在
+            if (groupColumn.IsGroup)
+            {
+                string sql = "SELECT " + Sql.Ident(groupColumn.PhysicalName) + " FROM " +
+                             Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture));
+                using (SqliteStatement st = _db.Prepare(sql))
+                {
+                    while (st.Read())
+                    {
+                        string raw = st.GetString(0) ?? string.Empty;
+                        if (GroupValueSplitter.Contains(raw, value))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+
             long count = _db.ScalarLong(
                 "SELECT COUNT(*) FROM " + Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture)) +
                 " WHERE " + Sql.Ident(groupColumn.PhysicalName) + " = ?",

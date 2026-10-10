@@ -255,6 +255,29 @@
                                             MinWidth="150"
                                             Click="OnOpenBackup" />
                                 </StackPanel>
+
+                                <TextBlock Text="分组"
+                                           Style="{StaticResource SectionTitle}"
+                                           Margin="0,20,0,8" />
+                                <Grid Width="440" HorizontalAlignment="Left">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="88" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="分隔符"
+                                               Style="{StaticResource HintText}"
+                                               VerticalAlignment="Center" />
+                                    <TextBox x:Name="TxtGroupSeparator"
+                                             Grid.Column="1"
+                                             MinHeight="28"
+                                             TextChanged="OnGroupSeparatorChanged"
+                                             ToolTip="分组列一个单元格里含多个分组值时用此符号分隔；留空表示不拆分" />
+                                </Grid>
+                                <TextBlock Style="{StaticResource HintText}"
+                                           Margin="0,6,0,0"
+                                           TextWrapping="Wrap"
+                                           Text="分隔符前后会自动补一个空格；留空表示不拆分。" />
                             </StackPanel>
                         </Border>
                     </Grid>

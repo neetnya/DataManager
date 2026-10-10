@@ -192,7 +192,8 @@ namespace DataManager.Services
             args.Add(tid);
             args.Add(like);
 
-            // 分组值归属：该行的某个分组列的当前值，正好是某个被打标签的分组值
+            // 分组值归属：该行的某个分组列的当前值（可能含多个分组），
+            // 正好是某个被打标签的分组值
             foreach (AppColumn c in table.Columns)
             {
                 if (!c.IsGroup)
@@ -200,16 +201,39 @@ namespace DataManager.Services
                     continue;
                 }
 
-                sb.Append(" OR rid IN (SELECT r0.rid FROM ").Append(physical).Append(" r0 WHERE r0.")
-                  .Append(Sql.Ident(c.PhysicalName))
-                  .Append(" IN (SELECT l.group_value FROM meta_tag_link l JOIN meta_tag g ON g.id = l.tag_id ")
-                  .Append("WHERE l.table_id = ? AND l.scope = 1 AND l.column_id = ? AND g.name LIKE ? ESCAPE '\\'))");
+                string cell = "r0." + Sql.Ident(c.PhysicalName);
+                string match = BuildGroupValueMatchSql(cell, "l.group_value");
+
+                sb.Append(" OR rid IN (SELECT r0.rid FROM ").Append(physical).Append(" r0 ")
+                  .Append("JOIN (SELECT l.group_value FROM meta_tag_link l JOIN meta_tag g ON g.id = l.tag_id ")
+                  .Append("WHERE l.table_id = ? AND l.scope = 1 AND l.column_id = ? AND g.name LIKE ? ESCAPE '\\') l ON 1=1 ")
+                  .Append("WHERE ").Append(match).Append(")");
                 args.Add(tid);
                 args.Add(c.Id.ToString(CultureInfo.InvariantCulture));
                 args.Add(like);
             }
 
             return "(" + sb + ")";
+        }
+
+        /// <summary>
+        /// 生成“单元格值按分隔符拆分后是否包含某个分组值”的 SQL 条件。
+        /// cellExpr 为单元格列表达式，valueExpr 为分组值表达式。
+        /// 分隔符为空时退化为精确相等。
+        /// </summary>
+        private static string BuildGroupValueMatchSql(string cellExpr, string valueExpr)
+        {
+            string sep = GroupValueSplitter.Separator;
+            if (string.IsNullOrEmpty(sep))
+            {
+                return cellExpr + " = " + valueExpr;
+            }
+
+            string sepLit = Sql.Literal(Sql.EscapeLike(sep));
+            return "(" + cellExpr + " = " + valueExpr +
+                " OR " + cellExpr + " LIKE (" + valueExpr + " || " + sepLit + " || '%') ESCAPE '\\'" +
+                " OR " + cellExpr + " LIKE ('%' || " + sepLit + " || " + valueExpr + " || " + sepLit + " || '%') ESCAPE '\\'" +
+                " OR " + cellExpr + " LIKE ('%' || " + sepLit + " || " + valueExpr + ") ESCAPE '\\')";
         }
 
         /// <summary>按条件读取数据行（固定排序在此生效）。</summary>
@@ -279,7 +303,7 @@ namespace DataManager.Services
             return null;
         }
 
-        /// <summary>某列当前已有的值（去重，用于分组下拉）。</summary>
+        /// <summary>某列当前已有的值（去重，用于分组下拉）。分组列按分隔符拆分后去重。</summary>
         public List<string> DistinctValues(AppTable table, AppColumn column)
         {
             var list = new List<string>();
@@ -291,8 +315,27 @@ namespace DataManager.Services
             {
                 while (st.Read())
                 {
-                    list.Add(st.GetString(0) ?? string.Empty);
+                    string raw = st.GetString(0) ?? string.Empty;
+                    if (column.IsGroup)
+                    {
+                        foreach (string part in GroupValueSplitter.Split(raw))
+                        {
+                            if (!list.Contains(part))
+                            {
+                                list.Add(part);
+                            }
+                        }
+                    }
+                    else if (raw.Length > 0 && !list.Contains(raw))
+                    {
+                        list.Add(raw);
+                    }
                 }
+            }
+
+            if (column.IsGroup)
+            {
+                list.Sort(StringComparer.Ordinal);
             }
 
             return list;

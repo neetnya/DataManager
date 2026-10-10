@@ -56,6 +56,13 @@ namespace DataManager.Services
         /// <summary>是否显示表格网格线。</summary>
         public bool GridShowLines { get; set; } = true;
 
+        /// <summary>
+        /// 分组列的分隔符：一个单元格里含多个分组值时用此符号分隔。
+        /// 只存符号本身（默认“/”），前后空格由代码补齐。
+        /// 空字符串表示不拆分（整段文本视为一个分组）。
+        /// </summary>
+        public string GroupSeparator { get; set; } = "/";
+
         // ---- 列宽记忆：表 Id → 物理列名 → 宽度 ----
 
         /// <summary>用户手动调整过的列宽。</summary>
@@ -85,6 +92,7 @@ namespace DataManager.Services
                 GridFontItalic = GridFontItalic,
                 GridRowHeight = GridRowHeight,
                 GridShowLines = GridShowLines,
+                GroupSeparator = GroupSeparator,
                 WindowWidth = WindowWidth,
                 WindowHeight = WindowHeight,
             };
@@ -153,6 +161,83 @@ namespace DataManager.Services
             }
 
             return 0;
+        }
+    }
+
+    /// <summary>分组列多值拆分的统一工具，全项目共用同一套拆分规则。</summary>
+    public static class GroupValueSplitter
+    {
+        /// <summary>
+        /// 实际生效的分隔符：把配置里的符号（默认“/”）前后各补一个空格。
+        /// 配置为 null 时按默认“/”处理；配置为“”或纯空白时不拆分。
+        /// </summary>
+        public static string Separator
+        {
+            get
+            {
+                string s = App.Settings?.GroupSeparator;
+                if (string.IsNullOrWhiteSpace(s))
+                {
+                    return s ?? string.Empty;
+                }
+
+                return " " + s.Trim() + " ";
+            }
+        }
+
+        /// <summary>
+        /// 把单元格文本按分隔符拆成若干分组值；去重、去空白、去掉空段。
+        /// 分隔符为空时不做拆分，整段（trim 后）作为唯一分组。
+        /// </summary>
+        public static List<string> Split(string value)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(value))
+            {
+                return result;
+            }
+
+            string sep = Separator;
+            if (string.IsNullOrEmpty(sep))
+            {
+                string t = value.Trim();
+                if (t.Length > 0)
+                {
+                    result.Add(t);
+                }
+
+                return result;
+            }
+
+            foreach (string part in value.Split(new[] { sep }, StringSplitOptions.None))
+            {
+                string t = part.Trim();
+                if (t.Length > 0 && !result.Contains(t))
+                {
+                    result.Add(t);
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>单元格文本中是否包含指定的分组值（作为其中一个拆分项）。</summary>
+        public static bool Contains(string cellValue, string groupValue)
+        {
+            if (string.IsNullOrEmpty(groupValue))
+            {
+                return false;
+            }
+
+            foreach (string p in Split(cellValue))
+            {
+                if (string.Equals(p, groupValue, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 

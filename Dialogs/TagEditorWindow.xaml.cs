@@ -51,7 +51,11 @@ namespace DataManager
             {
                 if (_toGroup)
                 {
-                    _groupValues.Add(r.Cells[_column.Ordinal].Value ?? string.Empty);
+                    // 分组列一个单元格可能含多个分组值，全部拆开作为打标签目标
+                    foreach (string part in GroupValueSplitter.Split(r.Cells[_column.Ordinal].Value))
+                    {
+                        _groupValues.Add(part);
+                    }
                 }
                 else
                 {
@@ -162,12 +166,12 @@ namespace DataManager
                     }
                     else
                     {
-                        // 分组归属：该行对应分组列的值等于标签绑定的值
+                        // 分组归属：该行对应分组列的值（按分隔符拆分后）包含标签绑定的值
                         for (int i = 0; i < _table.Columns.Count; i++)
                         {
                             AppColumn c = _table.Columns[i];
                             if (c.Id == l.ColumnId && c.IsGroup &&
-                                string.Equals(r.Get(i), l.GroupValue, StringComparison.Ordinal))
+                                GroupValueSplitter.Contains(r.Get(i), l.GroupValue))
                             {
                                 hit = true;
                                 break;
@@ -463,7 +467,7 @@ namespace DataManager
                 {
                     if (l.Scope == TagScope.GroupValue &&
                         l.ColumnId == _column.Id &&
-                        string.Equals(l.GroupValue, CurrentValue, StringComparison.Ordinal))
+                        GroupValueSplitter.Contains(CurrentValue, l.GroupValue))
                     {
                         current.Add(tag);
                     }
