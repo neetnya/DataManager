@@ -101,7 +101,6 @@ namespace DataManager
             {
                 _table = null;
                 _rowSource.Clear();
-                TxtCurrentTable.Text = string.Empty;
                 UpdateToolbarState();
                 TxtFooter.Text = "还没有数据表，请点击右上角【设置】创建。";
             }
@@ -652,10 +651,6 @@ namespace DataManager
 
             BtnQuickQuery.Visibility = has && _table.HasQuickQuery ? Visibility.Visible : Visibility.Collapsed;
             BtnClearFilter.Visibility = _spec != null && _spec.HasAnyFilter ? Visibility.Visible : Visibility.Collapsed;
-
-            TxtCurrentTable.Text = has
-                ? _table.Name + "（" + _table.Columns.Count.ToString(CultureInfo.InvariantCulture) + " 列）"
-                : string.Empty;
         }
 
         // =================================================================

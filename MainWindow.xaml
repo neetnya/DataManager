@@ -118,21 +118,6 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <!-- 当前表标题 -->
-                <Border Grid.Row="0"
-                        Background="{StaticResource SurfaceBrush}"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="0,0,0,1"
-                        Padding="12,4">
-                    <TextBlock x:Name="TxtCurrentTable"
-                               Text=""
-                               FontSize="13"
-                               FontWeight="SemiBold"
-                               Foreground="{StaticResource TextBrush}"
-                               VerticalAlignment="Center"
-                               TextTrimming="CharacterEllipsis" />
-                </Border>
-
                 <!-- 标签展示条 -->
                 <Border x:Name="TagBar"
                         Grid.Row="1"
