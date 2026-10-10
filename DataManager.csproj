@@ -9,6 +9,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DataManager</AssemblyName>
     <RootNamespace>DataManager</RootNamespace>
+    <ApplicationIcon>DataManager.ico</ApplicationIcon>
     <AssemblyTitle>轻量数据管理工具</AssemblyTitle>
     <Product>轻量数据管理工具</Product>
     <Version>1.0.0</Version>
