@@ -775,6 +775,13 @@ namespace DataManager
                 return;
             }
 
+            // URL 列不进入编辑：双击只负责用浏览器打开链接
+            if (_table.Columns[index].IsUrl)
+            {
+                e.Cancel = true;
+                return;
+            }
+
             _editingCell = row.Cells[index];
             _editingOriginal = _editingCell.Value;
         }
@@ -854,7 +861,7 @@ namespace DataManager
 
         /// <summary>
         /// 双击单元格：URL 列用默认浏览器打开链接（不校验、不进入编辑）；
-        /// 其余列直接进入编辑（避免默认行为下要三击才编辑的问题）。
+        /// 其余列直接进入编辑并立即聚焦（避免默认行为下要三击、或光标未落位的问题）。
         /// </summary>
         private void OnGridMouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
@@ -892,26 +899,68 @@ namespace DataManager
 
             if (column.IsUrl)
             {
-                // 双击 URL 列不应进入编辑：若默认行为已开始编辑，先取消。
-                if (cell.IsEditing)
-                {
-                    Grid.CancelEdit(DataGridEditingUnit.Cell);
-                    Grid.CancelEdit(DataGridEditingUnit.Row);
-                }
-
+                // BeginningEdit 已拦截 URL 列，这里直接打开链接即可
                 OpenUrlInBrowser(row.Cells[index].Value);
                 e.Handled = true;
                 return;
             }
 
-            // 普通列：确保进入编辑
+            // 普通列：进入编辑，并把焦点切到编辑控件，让光标立刻可用
             if (!cell.IsEditing)
             {
                 Grid.CurrentCell = new DataGridCellInfo(cell);
                 Grid.BeginEdit();
             }
 
+            FocusEditingControl(cell);
+
             e.Handled = true;
+        }
+
+        /// <summary>把键盘焦点交给当前编辑单元格里的输入控件（TextBox / 可编辑 ComboBox），并全选文本。</summary>
+        private void FocusEditingControl(DataGridCell cell)
+        {
+            // BeginEdit 切换模板是异步的，等布局完成后再聚焦
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!cell.IsEditing)
+                {
+                    return;
+                }
+
+                var content = cell.Content as UIElement;
+                if (content == null)
+                {
+                    return;
+                }
+
+                Control target = null;
+                if (content is TextBox tb)
+                {
+                    target = tb;
+                }
+                else if (content is ComboBox cb)
+                {
+                    target = cb;
+                }
+
+                // ComboBox 可编辑时，真正接收输入的是它内部的 TextBox 部件
+                if (target is ComboBox combo && combo.IsEditable && combo.Template != null)
+                {
+                    target = combo.Template.FindName("PART_EditableTextBox", combo) as TextBox ?? target;
+                }
+
+                if (target != null)
+                {
+                    target.Focus();
+                    Keyboard.Focus(target);
+
+                    if (target is TextBox box)
+                    {
+                        box.SelectAll();
+                    }
+                }
+            }), System.Windows.Threading.DispatcherPriority.Background);
         }
 
         /// <summary>用系统默认浏览器打开链接；内容为空或打开失败时给出轻提示。</summary>
