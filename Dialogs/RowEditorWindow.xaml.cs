@@ -114,6 +114,11 @@ namespace DataManager
                 marks.Add("分组");
             }
 
+            if (column.IsUrl)
+            {
+                marks.Add("URL");
+            }
+
             string suffix = marks.Count > 0 ? "（" + string.Join("、", marks) + "）" : string.Empty;
             return column.DisplayName + suffix;
         }

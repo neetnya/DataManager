@@ -160,6 +160,7 @@
                           PreviewKeyDown="OnGridPreviewKeyDown"
                           SelectionChanged="OnGridSelectionChanged"
                           LoadingRow="OnGridLoadingRow"
+                          MouseDoubleClick="OnGridMouseDoubleClick"
                           PreviewMouseRightButtonDown="OnGridRightButtonDown"
                           ContextMenuOpening="OnGridContextMenuOpening">
                     <DataGrid.ColumnHeaderStyle>

@@ -347,8 +347,9 @@ namespace DataManager
                 {
                     Tag = column.Id,
                     ToolTip = "按分组值筛选（可下拉选择，也可直接输入；清空表示全部）",
-                    FontSize = 12,
-                    MinHeight = 24,
+                    FontSize = 13,
+                    Height = 28,
+                    VerticalAlignment = VerticalAlignment.Center,
                     IsEditable = true,
                     Text = existing,
                 };
@@ -375,8 +376,9 @@ namespace DataManager
                 {
                     Tag = column.Id,
                     ToolTip = "搜索本列（模糊、大小写不敏感）",
-                    FontSize = 12,
-                    MinHeight = 24,
+                    FontSize = 13,
+                    Height = 28,
+                    VerticalAlignment = VerticalAlignment.Center,
                     Padding = new Thickness(6, 2, 6, 2),
                     Text = existing,
                 };
@@ -848,6 +850,91 @@ namespace DataManager
         private void OnGridLoadingRow(object sender, DataGridRowEventArgs e)
         {
             e.Row.Header = (e.Row.GetIndex() + 1).ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// 双击单元格：URL 列用默认浏览器打开链接（不校验、不进入编辑）；
+        /// 其余列直接进入编辑（避免默认行为下要三击才编辑的问题）。
+        /// </summary>
+        private void OnGridMouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            if (_table == null)
+            {
+                return;
+            }
+
+            // 只处理左键；右键双击交给上下文菜单流程
+            if (e.ChangedButton != MouseButton.Left)
+            {
+                return;
+            }
+
+            // 双击落在列头（筛选框）上时，交给搜索框本身处理，不要抢占
+            DependencyObject source = e.OriginalSource as DependencyObject;
+            if (source != null && FindAncestor<System.Windows.Controls.Primitives.DataGridColumnHeader>(source) != null)
+            {
+                return;
+            }
+
+            DataGridCell cell = source != null ? FindAncestor<DataGridCell>(source) : null;
+            if (cell == null || !(cell.DataContext is RowVm row) || cell.Column == null)
+            {
+                return;
+            }
+
+            int index = cell.Column.DisplayIndex;
+            if (index < 0 || index >= _table.Columns.Count)
+            {
+                return;
+            }
+
+            AppColumn column = _table.Columns[index];
+
+            if (column.IsUrl)
+            {
+                // 双击 URL 列不应进入编辑：若默认行为已开始编辑，先取消。
+                if (cell.IsEditing)
+                {
+                    Grid.CancelEdit(DataGridEditingUnit.Cell);
+                    Grid.CancelEdit(DataGridEditingUnit.Row);
+                }
+
+                OpenUrlInBrowser(row.Cells[index].Value);
+                e.Handled = true;
+                return;
+            }
+
+            // 普通列：确保进入编辑
+            if (!cell.IsEditing)
+            {
+                Grid.CurrentCell = new DataGridCellInfo(cell);
+                Grid.BeginEdit();
+            }
+
+            e.Handled = true;
+        }
+
+        /// <summary>用系统默认浏览器打开链接；内容为空或打开失败时给出轻提示。</summary>
+        private void OpenUrlInBrowser(string url)
+        {
+            string link = (url ?? string.Empty).Trim();
+            if (link.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = link,
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageWindow.Show(this, "无法打开链接：\n\n" + ex.Message, "URL", Dialogs.MessageTone.Warning);
+            }
         }
 
         private void OnGridSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1655,17 +1742,67 @@ namespace DataManager
 
                 item.Click += (s, args) =>
                 {
-                    RemoveTagFromCell(column, row, captured);
+                    RemoveTagFromCell(column, captured);
                 };
 
                 MenuRemoveTag.Items.Add(item);
             }
         }
 
-        /// <summary>把某个标签从当前单元格对应的归属对象上移除（标签本身保留）。</summary>
-        private void RemoveTagFromCell(AppColumn column, RowVm row, Tag tag)
+        /// <summary>收集当前所有选中的行（去重），用于批量操作标签。</summary>
+        private List<RowVm> CollectSelectedRows()
         {
-            string value = row.Cells[column.Ordinal].Value ?? string.Empty;
+            var rows = new List<RowVm>();
+
+            foreach (DataGridCellInfo info in Grid.SelectedCells)
+            {
+                if (info.Item is RowVm row && !rows.Contains(row))
+                {
+                    rows.Add(row);
+                }
+            }
+
+            foreach (object item in Grid.SelectedItems)
+            {
+                if (item is RowVm row && !rows.Contains(row))
+                {
+                    rows.Add(row);
+                }
+            }
+
+            return rows;
+        }
+
+        /// <summary>把某个标签从所有选中行的对应归属对象上移除（标签本身保留，批量）。</summary>
+        private void RemoveTagFromCell(AppColumn column, Tag tag)
+        {
+            List<RowVm> rows = CollectSelectedRows();
+            if (rows.Count == 0)
+            {
+                return;
+            }
+
+            // 归纳所有目标：行标签按行 Id，分组标签按「该列的分组值」。
+            var rowIds = new HashSet<long>();
+            var groupValues = new HashSet<string>();
+
+            if (column.IsGroup)
+            {
+                foreach (RowVm row in rows)
+                {
+                    foreach (string part in GroupValueSplitter.Split(row.Cells[column.Ordinal].Value ?? string.Empty))
+                    {
+                        groupValues.Add(part);
+                    }
+                }
+            }
+            else
+            {
+                foreach (RowVm row in rows)
+                {
+                    rowIds.Add(row.RowId);
+                }
+            }
 
             foreach (TagLink l in Data.Schema.LoadTagLinks(_table.Id))
             {
@@ -1678,14 +1815,14 @@ namespace DataManager
                 {
                     if (l.Scope == TagScope.GroupValue &&
                         l.ColumnId == column.Id &&
-                        GroupValueSplitter.Contains(value, l.GroupValue))
+                        groupValues.Contains(l.GroupValue ?? string.Empty))
                     {
                         Data.Schema.UnlinkTag(l.Id);
                     }
                 }
                 else
                 {
-                    if (l.Scope == TagScope.Row && l.RowId == row.RowId)
+                    if (l.Scope == TagScope.Row && rowIds.Contains(l.RowId))
                     {
                         Data.Schema.UnlinkTag(l.Id);
                     }
@@ -1728,22 +1865,7 @@ namespace DataManager
             }
 
             // 收集所有选中的行（去重）：多选时批量打标签
-            var rows = new List<RowVm>();
-            foreach (DataGridCellInfo info in Grid.SelectedCells)
-            {
-                if (info.Item is RowVm row && !rows.Contains(row))
-                {
-                    rows.Add(row);
-                }
-            }
-
-            foreach (object item in Grid.SelectedItems)
-            {
-                if (item is RowVm row && !rows.Contains(row))
-                {
-                    rows.Add(row);
-                }
-            }
+            List<RowVm> rows = CollectSelectedRows();
 
             if (rows.Count == 0)
             {

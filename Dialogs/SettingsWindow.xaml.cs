@@ -96,6 +96,12 @@ namespace DataManager
             }
         }
 
+        public bool IsUrl
+        {
+            get => Column.IsUrl;
+            set => SetFlag(ColumnFlags.Url, value);
+        }
+
         public int SortDirectionIndex
         {
             get => Column.SortDescending ? 1 : 0;
@@ -177,6 +183,7 @@ namespace DataManager
             Raise(nameof(IsUnique));
             Raise(nameof(IsGroup));
             Raise(nameof(IsSort));
+            Raise(nameof(IsUrl));
         }
 
         private void Raise(string name)

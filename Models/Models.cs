@@ -23,6 +23,9 @@ namespace DataManager.Models
 
         /// <summary>参与固定排序。</summary>
         Sort = 16,
+
+        /// <summary>URL 列：双击单元格用默认浏览器打开，不做格式校验。</summary>
+        Url = 32,
     }
 
     /// <summary>一张用户自建的表。</summary>
@@ -104,6 +107,8 @@ namespace DataManager.Models
         public bool IsGroup => (Flags & ColumnFlags.Group) != 0;
 
         public bool IsSort => (Flags & ColumnFlags.Sort) != 0;
+
+        public bool IsUrl => (Flags & ColumnFlags.Url) != 0;
 
         public AppColumn Clone()
         {

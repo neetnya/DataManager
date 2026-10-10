@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS meta_column (
     is_unique   INTEGER NOT NULL DEFAULT 0,
     is_group    INTEGER NOT NULL DEFAULT 0,
     is_sort     INTEGER NOT NULL DEFAULT 0,
+    is_url      INTEGER NOT NULL DEFAULT 0,
     sort_desc   INTEGER NOT NULL DEFAULT 0,
     sort_prio   INTEGER NOT NULL DEFAULT 0
 )");
@@ -87,6 +88,11 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
             if (!ColumnExists("meta_column", "sort_prio"))
             {
                 _db.Execute("ALTER TABLE meta_column ADD COLUMN sort_prio INTEGER NOT NULL DEFAULT 0");
+            }
+
+            if (!ColumnExists("meta_column", "is_url"))
+            {
+                _db.Execute("ALTER TABLE meta_column ADD COLUMN is_url INTEGER NOT NULL DEFAULT 0");
             }
         }
 
@@ -127,7 +133,7 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
             }
 
             using (SqliteStatement st = _db.Prepare(
-                "SELECT id, table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, sort_desc, sort_prio " +
+                "SELECT id, table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, is_url, sort_desc, sort_prio " +
                 "FROM meta_column ORDER BY table_id, ordinal, id"))
             {
                 while (st.Read())
@@ -172,8 +178,13 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
                         col.Flags |= ColumnFlags.Sort;
                     }
 
-                    col.SortDescending = st.GetInt64(9) != 0;
-                    col.SortPriority = (int)st.GetInt64(10);
+                    if (st.GetInt64(9) != 0)
+                    {
+                        col.Flags |= ColumnFlags.Url;
+                    }
+
+                    col.SortDescending = st.GetInt64(10) != 0;
+                    col.SortPriority = (int)st.GetInt64(11);
                     table.Columns.Add(col);
                 }
             }
@@ -309,8 +320,8 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
                 " ADD COLUMN " + Sql.Ident(physical) + " TEXT");
 
             using (SqliteStatement st = _db.Prepare(
-                "INSERT INTO meta_column (table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, sort_desc, sort_prio) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                "INSERT INTO meta_column (table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, is_url, sort_desc, sort_prio) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
             {
                 st.Bind(1, tableId);
                 st.Bind(2, ordinal);
@@ -320,8 +331,9 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
                 st.Bind(6, (flags & ColumnFlags.Unique) != 0 ? 1L : 0L);
                 st.Bind(7, (flags & ColumnFlags.Group) != 0 ? 1L : 0L);
                 st.Bind(8, (flags & ColumnFlags.Sort) != 0 ? 1L : 0L);
-                st.Bind(9, sortDescending ? 1L : 0L);
-                st.Bind(10, (long)sortPriority);
+                st.Bind(9, (flags & ColumnFlags.Url) != 0 ? 1L : 0L);
+                st.Bind(10, sortDescending ? 1L : 0L);
+                st.Bind(11, (long)sortPriority);
                 st.Step();
             }
 
@@ -380,7 +392,7 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         public void UpdateColumn(AppColumn column)
         {
             using (SqliteStatement st = _db.Prepare(
-                "UPDATE meta_column SET ordinal = ?, is_quick = ?, is_queried = ?, is_unique = ?, is_group = ?, is_sort = ?, sort_desc = ?, sort_prio = ? WHERE id = ?"))
+                "UPDATE meta_column SET ordinal = ?, is_quick = ?, is_queried = ?, is_unique = ?, is_group = ?, is_sort = ?, is_url = ?, sort_desc = ?, sort_prio = ? WHERE id = ?"))
             {
                 st.Bind(1, (long)column.Ordinal);
                 st.Bind(2, column.IsQuick ? 1L : 0L);
@@ -388,9 +400,10 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
                 st.Bind(4, column.IsUnique ? 1L : 0L);
                 st.Bind(5, column.IsGroup ? 1L : 0L);
                 st.Bind(6, column.IsSort ? 1L : 0L);
-                st.Bind(7, column.SortDescending ? 1L : 0L);
-                st.Bind(8, (long)column.SortPriority);
-                st.Bind(9, column.Id);
+                st.Bind(7, column.IsUrl ? 1L : 0L);
+                st.Bind(8, column.SortDescending ? 1L : 0L);
+                st.Bind(9, (long)column.SortPriority);
+                st.Bind(10, column.Id);
                 st.Step();
             }
         }
