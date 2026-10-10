@@ -28,6 +28,7 @@ namespace DataManager
             if (existing != null)
             {
                 Title = "编辑数据";
+                BtnContinueAdd.Visibility = Visibility.Collapsed;
             }
 
             BuildFields();
@@ -135,13 +136,28 @@ namespace DataManager
 
         private void OnSave(object sender, RoutedEventArgs e)
         {
+            if (TrySave())
+            {
+                this.CloseWithResult(true);
+            }
+        }
+
+        /// <summary>保存成功后立即插入数据、不关闭窗口，且不清空表单，方便连续录入相近的多条。</summary>
+        private void OnContinueAdd(object sender, RoutedEventArgs e)
+        {
+            TrySave();
+        }
+
+        /// <summary>把当前表单内容写入数据表；成功返回 true。</summary>
+        private bool TrySave()
+        {
             string[] values = CollectValues();
 
             string error = _data.Rows.ValidateRow(_table, values, _existing?.RowId);
             if (error != null)
             {
                 MessageWindow.Show(this, error, "无法保存", Dialogs.MessageTone.Warning);
-                return;
+                return false;
             }
 
             try
@@ -156,17 +172,17 @@ namespace DataManager
                     if (updateError != null)
                     {
                         MessageWindow.Show(this, updateError, "无法保存", Dialogs.MessageTone.Warning);
-                        return;
+                        return false;
                     }
                 }
             }
             catch (Exception ex)
             {
                 MessageWindow.Show(this, "保存失败：\n\n" + ex.Message, "无法保存", Dialogs.MessageTone.Danger);
-                return;
+                return false;
             }
 
-            this.CloseWithResult(true);
+            return true;
         }
 
         private void OnCancel(object sender, RoutedEventArgs e)

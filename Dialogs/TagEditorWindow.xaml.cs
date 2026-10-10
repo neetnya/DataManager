@@ -24,18 +24,40 @@ namespace DataManager
         private readonly AppData _data;
         private readonly bool _toGroup;
 
+        /// <summary>选中的行（批量）；至少 1 行。</summary>
+        private readonly List<RowVm> _rows;
+
+        /// <summary>行标签模式下需要打标签的所有行 Id。</summary>
+        private readonly HashSet<long> _rowIds = new HashSet<long>();
+
+        /// <summary>分组标签模式下需要打标签的所有分组值。</summary>
+        private readonly HashSet<string> _groupValues = new HashSet<string>();
+
         /// <summary>窗口内发生过改动，关闭时调用方需要刷新。</summary>
         public bool Changed { get; private set; }
 
-        public TagEditorWindow(AppTable table, AppColumn column, RowVm row, AppData data)
+        public TagEditorWindow(AppTable table, AppColumn column, List<RowVm> rows, AppData data)
         {
             InitializeComponent();
 
             _table = table;
             _column = column;
-            _row = row;
             _data = data;
             _toGroup = column.IsGroup;
+            _rows = rows ?? new List<RowVm>();
+            _row = _rows.Count > 0 ? _rows[0] : null;
+
+            foreach (RowVm r in _rows)
+            {
+                if (_toGroup)
+                {
+                    _groupValues.Add(r.Cells[_column.Ordinal].Value ?? string.Empty);
+                }
+                else
+                {
+                    _rowIds.Add(r.RowId);
+                }
+            }
 
             BuildScopeText();
             RebuildTagRows();
@@ -45,27 +67,71 @@ namespace DataManager
 
         private string CurrentValue => _row.Cells[_column.Ordinal].Value ?? string.Empty;
 
-        /// <summary>当前归属对象上已挂的标签 Id。</summary>
+        /// <summary>当前所有归属对象上都已挂的标签 Id（批量时为全部命中才算）。</summary>
         private HashSet<long> AppliedTagIds()
         {
             var ids = new HashSet<long>();
+            List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
+            List<Tag> tags = _data.Schema.LoadTags(_table.Id);
 
-            if (_toGroup)
+            foreach (Tag tag in tags)
             {
-                foreach (Tag t in _row.Cells[_column.Ordinal].GroupTags)
+                if (IsAppliedToAllTargets(tag, links))
                 {
-                    ids.Add(t.Id);
-                }
-            }
-            else
-            {
-                foreach (Tag t in _row.RowTags)
-                {
-                    ids.Add(t.Id);
+                    ids.Add(tag.Id);
                 }
             }
 
             return ids;
+        }
+
+        /// <summary>该标签是否已挂到所有目标对象上。</summary>
+        private bool IsAppliedToAllTargets(Tag tag, List<TagLink> links)
+        {
+            if (_toGroup)
+            {
+                foreach (string gv in _groupValues)
+                {
+                    bool hit = false;
+                    foreach (TagLink l in links)
+                    {
+                        if (l.TagId == tag.Id && l.Scope == TagScope.GroupValue &&
+                            l.ColumnId == _column.Id &&
+                            string.Equals(l.GroupValue, gv, StringComparison.Ordinal))
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+
+                    if (!hit)
+                    {
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                foreach (long rowId in _rowIds)
+                {
+                    bool hit = false;
+                    foreach (TagLink l in links)
+                    {
+                        if (l.TagId == tag.Id && l.Scope == TagScope.Row && l.RowId == rowId)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+
+                    if (!hit)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
         /// <summary>该标签在整张表里被多少行用到（分组标签算同组所有行）。</summary>
@@ -129,11 +195,26 @@ namespace DataManager
             if (_toGroup)
             {
                 string shown = CurrentValue.Length == 0 ? "(空值)" : CurrentValue;
-                TxtScope.Text = "归属分组值：" + shown + "（该分组下的所有行共用这些标签）";
+                if (_groupValues.Count > 1)
+                {
+                    TxtScope.Text = "归属分组值（共 " + _groupValues.Count + " 个值，批量）：" +
+                                    "该分组下的所有行共用这些标签";
+                }
+                else
+                {
+                    TxtScope.Text = "归属分组值：" + shown + "（该分组下的所有行共用这些标签）";
+                }
             }
             else
             {
-                TxtScope.Text = "归属整行（第 " + _row.DisplayIndex + " 行）";
+                if (_rowIds.Count > 1)
+                {
+                    TxtScope.Text = "归属整行（已选 " + _rowIds.Count + " 行，批量）";
+                }
+                else
+                {
+                    TxtScope.Text = "归属整行（第 " + _row.DisplayIndex + " 行）";
+                }
             }
         }
 
@@ -287,18 +368,24 @@ namespace DataManager
             return grid;
         }
 
-        /// <summary>把标签加到当前归属对象上。</summary>
+        /// <summary>把标签加到所有目标对象上（批量）。</summary>
         private void AddToCurrent(Tag tag)
         {
             try
             {
                 if (_toGroup)
                 {
-                    _data.Schema.LinkTagToGroupValue(tag.Id, _table.Id, _column.Id, CurrentValue);
+                    foreach (string gv in _groupValues)
+                    {
+                        _data.Schema.LinkTagToGroupValue(tag.Id, _table.Id, _column.Id, gv);
+                    }
                 }
                 else
                 {
-                    _data.Schema.LinkTagToRow(tag.Id, _table.Id, _row.RowId);
+                    foreach (long rowId in _rowIds)
+                    {
+                        _data.Schema.LinkTagToRow(tag.Id, _table.Id, rowId);
+                    }
                 }
 
                 Changed = true;
@@ -310,7 +397,7 @@ namespace DataManager
             }
         }
 
-        /// <summary>把标签从当前归属对象上移除（标签本身保留）。</summary>
+        /// <summary>把标签从所有目标对象上移除（标签本身保留）。</summary>
         private void RemoveFromCurrent(Tag tag)
         {
             try
@@ -328,14 +415,14 @@ namespace DataManager
                     {
                         if (l.Scope == TagScope.GroupValue &&
                             l.ColumnId == _column.Id &&
-                            string.Equals(l.GroupValue, CurrentValue, StringComparison.Ordinal))
+                            _groupValues.Contains(l.GroupValue ?? string.Empty))
                         {
                             _data.Schema.UnlinkTag(l.Id);
                         }
                     }
                     else
                     {
-                        if (l.Scope == TagScope.Row && l.RowId == _row.RowId)
+                        if (l.Scope == TagScope.Row && _rowIds.Contains(l.RowId))
                         {
                             _data.Schema.UnlinkTag(l.Id);
                         }

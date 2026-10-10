@@ -31,6 +31,7 @@ namespace DataManager
         private System.Windows.Threading.DispatcherTimer _widthSaveTimer;
         private CellVm _editingCell;
         private string _editingOriginal;
+        private int _rightClickColumnIndex = -1;
 
         public MainWindow()
         {
@@ -428,7 +429,7 @@ namespace DataManager
             DebounceReload();
         }
 
-        /// <summary>单元格展示模板（值 + 分组标签角标）。</summary>
+        /// <summary>单元格展示模板（值 + 分组/行标签角标）。</summary>
         private DataTemplate BuildCellTemplate(AppColumn column)
         {
             var template = new DataTemplate();
@@ -442,21 +443,17 @@ namespace DataManager
             text.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
             text.SetBinding(FrameworkElement.ToolTipProperty, new Binding("Cells[" + column.Ordinal + "].Value"));
 
-            if (!column.IsGroup)
-            {
-                text.SetValue(FrameworkElement.MarginProperty, new Thickness(7, 0, 6, 0));
-                template.VisualTree = text;
-                return template;
-            }
+            // 分组列右侧显示分组标签角标；其余列右侧显示整行标签角标。
+            bool isGroup = column.IsGroup;
+            string tagBindingPath = isGroup ? "Cells[" + column.Ordinal + "].GroupTagText" : "RowTagText";
 
-            // 分组列：右侧再挂一个标签角标
             var dock = new FrameworkElementFactory(typeof(DockPanel));
             dock.SetValue(FrameworkElement.MarginProperty, new Thickness(7, 0, 6, 0));
             dock.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
             dock.SetValue(DockPanel.LastChildFillProperty, true);
 
             var tagText = new FrameworkElementFactory(typeof(TextBlock));
-            tagText.SetBinding(TextBlock.TextProperty, new Binding("Cells[" + column.Ordinal + "].GroupTagText"));
+            tagText.SetBinding(TextBlock.TextProperty, new Binding(tagBindingPath));
             tagText.SetValue(TextBlock.FontSizeProperty, 10.5);
             tagText.SetValue(TextBlock.ForegroundProperty, Application.Current.Resources["AccentBrush"]);
             tagText.SetValue(FrameworkElement.MarginProperty, new Thickness(6, 0, 0, 0));
@@ -1529,11 +1526,16 @@ namespace DataManager
             DependencyObject source = e.OriginalSource as DependencyObject;
             DataGridCell cell = FindAncestor<DataGridCell>(source);
 
-            if (cell != null && !cell.IsSelected)
+            if (cell != null)
             {
-                Grid.SelectedCells.Clear();
-                Grid.CurrentCell = new DataGridCellInfo(cell);
-                cell.IsSelected = true;
+                _rightClickColumnIndex = cell.Column != null ? cell.Column.DisplayIndex : -1;
+
+                if (!cell.IsSelected)
+                {
+                    Grid.SelectedCells.Clear();
+                    Grid.CurrentCell = new DataGridCellInfo(cell);
+                    cell.IsSelected = true;
+                }
             }
         }
 
@@ -1662,20 +1664,56 @@ namespace DataManager
 
         private void OnAddTag(object sender, RoutedEventArgs e)
         {
-            if (_table == null || Grid.SelectedCells.Count == 0)
+            if (_table == null)
             {
                 return;
             }
 
-            DataGridCellInfo info = Grid.SelectedCells[0];
-            int index = info.Column.DisplayIndex;
-            if (!(info.Item is RowVm row) || index < 0 || index >= _table.Columns.Count)
+            // 收集所有选中的行（去重）：多选时批量打标签
+            var rows = new List<RowVm>();
+            foreach (DataGridCellInfo info in Grid.SelectedCells)
+            {
+                if (info.Item is RowVm row && !rows.Contains(row))
+                {
+                    rows.Add(row);
+                }
+            }
+
+            foreach (object item in Grid.SelectedItems)
+            {
+                if (item is RowVm row && !rows.Contains(row))
+                {
+                    rows.Add(row);
+                }
+            }
+
+            if (rows.Count == 0)
+            {
+                return;
+            }
+
+            // 确定作用列：右键菜单用右键点中的列，否则用第一个选中单元格所在列
+            int index;
+            if (sender == MenuAddTag && _rightClickColumnIndex >= 0)
+            {
+                index = _rightClickColumnIndex;
+            }
+            else if (Grid.SelectedCells.Count > 0)
+            {
+                index = Grid.SelectedCells[0].Column.DisplayIndex;
+            }
+            else
+            {
+                index = 0;
+            }
+
+            if (index < 0 || index >= _table.Columns.Count)
             {
                 return;
             }
 
             AppColumn column = _table.Columns[index];
-            var dialog = new TagEditorWindow(_table, column, row, Data)
+            var dialog = new TagEditorWindow(_table, column, rows, Data)
             {
                 Owner = this,
             };

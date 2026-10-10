@@ -35,6 +35,11 @@
                     MinWidth="82"
                     Margin="0,0,8,0"
                     Click="OnCancel" />
+            <Button x:Name="BtnContinueAdd"
+                    Content="继续添加"
+                    MinWidth="82"
+                    Margin="0,0,8,0"
+                    Click="OnContinueAdd" />
             <Button Content="保存"
                     IsDefault="True"
                     MinWidth="82"
