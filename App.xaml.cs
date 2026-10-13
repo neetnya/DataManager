@@ -72,6 +72,16 @@ namespace DataManager
                 return;
             }
 
+            // 打开软件时自动做一次本地备份；失败不阻断启动
+            try
+            {
+                Services.BackupService.CreateLocalBackup(Data.Connection, "startup");
+            }
+            catch (Exception)
+            {
+                // 启动备份失败不影响正常使用
+            }
+
             var window = new MainWindow();
             MainWindow = window;
             window.Show();

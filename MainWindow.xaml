@@ -9,7 +9,8 @@
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}"
         UseLayoutRounding="True"
-        WindowStartupLocation="CenterScreen">
+        WindowStartupLocation="CenterScreen"
+        PreviewKeyDown="OnWindowPreviewKeyDown">
 
     <Grid>
         <Grid.RowDefinitions>

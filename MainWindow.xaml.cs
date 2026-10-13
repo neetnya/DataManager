@@ -33,6 +33,10 @@ namespace DataManager
         private string _editingOriginal;
         private int _rightClickColumnIndex = -1;
 
+        /// <summary>撤销历史：一次单元格修改（含粘贴的每个单元格）记一条，最多保留 10 步。</summary>
+        private readonly List<UndoEntry> _undoStack = new List<UndoEntry>();
+        private const int MaxUndoSteps = 10;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -834,6 +838,8 @@ namespace DataManager
                 return;
             }
 
+            PushUndo(row.RowId, column.Ordinal, oldValue, newValue);
+
             if (column.IsGroup)
             {
                 // 分组值变了：刷新该列的候选值与标签归属。
@@ -1025,6 +1031,46 @@ namespace DataManager
         // 剪贴板：Ctrl+C / Ctrl+V
         // =================================================================
 
+        /// <summary>
+        /// 窗口级 Ctrl+F 快捷查询：只要软件在前台且当前表可用快捷查询就触发，
+        /// 不再要求焦点落在表格内。用 PreviewKeyDown 在隧道路由阶段拦截，
+        /// 早于表格和各输入控件收到按键。
+        /// </summary>
+        private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.F && e.KeyboardDevice.Modifiers == ModifierKeys.Control)
+            {
+                // 正在编辑单元格时，把 Ctrl+F 让给编辑控件（例如文本框里的查找），不抢占
+                if (IsCellEditing())
+                {
+                    return;
+                }
+
+                if (_table != null && _table.HasQuickQuery)
+                {
+                    OnQuickQuery(this, new RoutedEventArgs());
+                    e.Handled = true;
+                }
+
+                return;
+            }
+
+            if (e.Key == Key.Z && e.KeyboardDevice.Modifiers == ModifierKeys.Control)
+            {
+                // 焦点在某个文本框（单元格编辑框、列头搜索框等）里时，
+                // 把 Ctrl+Z 让给文本框自身的撤销，不抢占。
+                if (Keyboard.FocusedElement is System.Windows.Controls.Primitives.TextBoxBase)
+                {
+                    return;
+                }
+
+                if (Undo())
+                {
+                    e.Handled = true;
+                }
+            }
+        }
+
         private void OnGridPreviewKeyDown(object sender, KeyEventArgs e)
         {
             // 正在编辑单元格时，把快捷键让给编辑控件本身
@@ -1049,13 +1095,6 @@ namespace DataManager
                 if (e.Key == Key.V && !editing)
                 {
                     PasteAtSelection();
-                    e.Handled = true;
-                    return;
-                }
-
-                if (e.Key == Key.F && !editing && _table != null && _table.HasQuickQuery)
-                {
-                    OnQuickQuery(this, new RoutedEventArgs());
                     e.Handled = true;
                     return;
                 }
@@ -1407,6 +1446,7 @@ namespace DataManager
 
                 foreach ((RowVm row, int col, string value) in pending)
                 {
+                    string old = row.Cells[col].Value ?? string.Empty;
                     Data.Connection.Execute(
                         "UPDATE " + Sql.Ident(_table.PhysicalName) + " SET " +
                         Sql.Ident(_table.Columns[col].PhysicalName) + " = ? WHERE rid = ?",
@@ -1414,6 +1454,7 @@ namespace DataManager
                         row.RowId.ToString(CultureInfo.InvariantCulture));
 
                     row.Cells[col].Value = value;
+                    PushUndo(row.RowId, col, old, value);
                 }
 
                 tx.Complete();
@@ -1488,6 +1529,38 @@ namespace DataManager
             {
                 return;
             }
+
+            // 删除前把行数据与行标签记录下来，供 Ctrl+Z 撤销恢复
+            var deletedValues = new List<string[]>();
+            var deletedRowTags = new List<List<long>>();
+
+            List<TagLink> links = Data.Schema.LoadTagLinks(_table.Id);
+            foreach (long rid in rowIds)
+            {
+                DataRow dataRow = Data.Rows.GetRow(_table, rid);
+                if (dataRow == null)
+                {
+                    // 行已不存在（极端情况），跳过记录但继续删除其余
+                    deletedValues.Add(Array.Empty<string>());
+                }
+                else
+                {
+                    deletedValues.Add(dataRow.Values);
+                }
+
+                var tags = new List<long>();
+                foreach (TagLink l in links)
+                {
+                    if (l.Scope == TagScope.Row && l.RowId == rid)
+                    {
+                        tags.Add(l.TagId);
+                    }
+                }
+
+                deletedRowTags.Add(tags);
+            }
+
+            PushUndoDeleteRows(deletedValues, deletedRowTags);
 
             Data.Rows.DeleteRows(_table, rowIds);
             ReloadRows();
@@ -2131,6 +2204,177 @@ namespace DataManager
             }
 
             base.OnClosing(e);
+        }
+
+        // =================================================================
+        // 撤销（Ctrl+Z）：单元格值修改
+        // =================================================================
+
+        /// <summary>撤销条目类型。</summary>
+        private enum UndoKind
+        {
+            /// <summary>单元格值修改。</summary>
+            Cell,
+
+            /// <summary>删除行。</summary>
+            DeleteRows,
+        }
+
+        /// <summary>一条可撤销操作。</summary>
+        private sealed class UndoEntry
+        {
+            public UndoKind Kind;
+
+            // —— 单元格修改（Cell）——
+            public long TableId;
+            public long RowId;
+            public int ColumnOrdinal;
+            public string OldValue;
+            public string NewValue;
+
+            // —— 删除行（DeleteRows）——
+            /// <summary>被删行的值，按列顺序（Ordinal）。</summary>
+            public List<string[]> DeletedRows;
+
+            /// <summary>与 DeletedRows 一一对应：每行归属的行标签 TagId。</summary>
+            public List<List<long>> DeletedRowTags;
+        }
+
+        /// <summary>记录一次已落库的单元格值变更，供 Ctrl+Z 恢复。超出上限时丢弃最旧记录。</summary>
+        private void PushUndo(long rowId, int columnOrdinal, string oldValue, string newValue)
+        {
+            if (_table == null)
+            {
+                return;
+            }
+
+            _undoStack.Add(new UndoEntry
+            {
+                Kind = UndoKind.Cell,
+                TableId = _table.Id,
+                RowId = rowId,
+                ColumnOrdinal = columnOrdinal,
+                OldValue = oldValue ?? string.Empty,
+                NewValue = newValue ?? string.Empty,
+            });
+
+            TrimUndoStack();
+        }
+
+        /// <summary>记录一次删除行操作（含行数据与行标签），供 Ctrl+Z 恢复。</summary>
+        private void PushUndoDeleteRows(List<string[]> values, List<List<long>> tags)
+        {
+            if (_table == null)
+            {
+                return;
+            }
+
+            _undoStack.Add(new UndoEntry
+            {
+                Kind = UndoKind.DeleteRows,
+                TableId = _table.Id,
+                DeletedRows = values,
+                DeletedRowTags = tags,
+            });
+
+            TrimUndoStack();
+        }
+
+        private void TrimUndoStack()
+        {
+            while (_undoStack.Count > MaxUndoSteps)
+            {
+                _undoStack.RemoveAt(0);
+            }
+        }
+
+        /// <summary>
+        /// 撤销最近一次操作（单元格修改或删除行）。返回是否执行了撤销。
+        /// </summary>
+        private bool Undo()
+        {
+            if (_undoStack.Count == 0)
+            {
+                return false;
+            }
+
+            UndoEntry entry = _undoStack[_undoStack.Count - 1];
+            _undoStack.RemoveAt(_undoStack.Count - 1);
+
+            // 撤销针对的是当前表；跨表或表已删时直接丢弃这条记录
+            if (_table == null || _table.Id != entry.TableId)
+            {
+                return true;
+            }
+
+            if (entry.Kind == UndoKind.DeleteRows)
+            {
+                UndoDeleteRows(entry);
+            }
+            else
+            {
+                UndoCell(entry);
+            }
+
+            ReloadRows();
+            RebuildTagBar();
+            return true;
+        }
+
+        /// <summary>撤销一次单元格修改：把旧值写回数据库。</summary>
+        private void UndoCell(UndoEntry entry)
+        {
+            AppColumn column = entry.ColumnOrdinal >= 0 && entry.ColumnOrdinal < _table.Columns.Count
+                ? _table.Columns[entry.ColumnOrdinal]
+                : null;
+            if (column == null)
+            {
+                return;
+            }
+
+            string error = Data.Rows.UpdateCell(_table, entry.RowId, column, entry.OldValue);
+            if (error != null)
+            {
+                MessageWindow.Show(this, "无法撤销：" + error, "撤销", Dialogs.MessageTone.Warning);
+            }
+        }
+
+        /// <summary>撤销一次删除行：把被删的行按原值重新插入，并恢复其行标签。</summary>
+        private void UndoDeleteRows(UndoEntry entry)
+        {
+            if (entry.DeletedRows == null || entry.DeletedRows.Count == 0)
+            {
+                return;
+            }
+
+            using (SqliteConnection.Tx tx = Data.Connection.Transaction())
+            {
+                for (int i = 0; i < entry.DeletedRows.Count; i++)
+                {
+                    string[] values = entry.DeletedRows[i];
+
+                    // 重新插入行数据；唯一约束冲突时整批回滚
+                    string error = Data.Rows.ValidateRow(_table, values, null);
+                    if (error != null)
+                    {
+                        MessageWindow.Show(this, "无法撤销删除：" + error, "撤销", Dialogs.MessageTone.Warning);
+                        return;
+                    }
+
+                    long newRowId = Data.Rows.InsertRow(_table, values);
+
+                    // 恢复该行归属的行标签（重新绑定到新 rid）
+                    if (entry.DeletedRowTags != null && i < entry.DeletedRowTags.Count)
+                    {
+                        foreach (long tagId in entry.DeletedRowTags[i])
+                        {
+                            Data.Schema.LinkTagToRow(tagId, _table.Id, newRowId);
+                        }
+                    }
+                }
+
+                tx.Complete();
+            }
         }
     }
 }
