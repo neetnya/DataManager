@@ -1521,15 +1521,6 @@ namespace DataManager
                 return;
             }
 
-            bool confirm = MessageWindow.Confirm(this, "确定要删除选中的 " + rowIds.Count.ToString(CultureInfo.InvariantCulture) + " 行吗？\n该行上的标签也会一并删除。",
-                "删除行",
-                Dialogs.MessageTone.Danger, Dialogs.MessageButtons.OkCancel);
-
-            if (!confirm)
-            {
-                return;
-            }
-
             // 删除前把行数据与行标签记录下来，供 Ctrl+Z 撤销恢复
             var deletedValues = new List<string[]>();
             var deletedRowTags = new List<List<long>>();
