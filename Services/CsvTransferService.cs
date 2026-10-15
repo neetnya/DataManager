@@ -24,9 +24,9 @@ namespace DataManager.Services
 
         /// <summary>
         /// 导入 CSV 为一张新表：按位置对应列，视作无任何配置的列，第一行也是数据。
-        /// 表名取 CSV 文件名。返回新表名。
+        /// 表名取 CSV 文件名。返回新表的 id（表名允许重复，不能靠名字选中）。
         /// </summary>
-        public string ImportAsNewTable(string csvPath, IList<AppTable> allTables)
+        public long ImportAsNewTable(string csvPath, IList<AppTable> allTables)
         {
             List<string[]> records = CsvService.ReadFile(csvPath);
             if (records.Count == 0)
@@ -49,10 +49,11 @@ namespace DataManager.Services
             }
 
             string name = TableNameFromFile(csvPath);
+            long tableId;
 
             using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                long tableId = _schema.CreateTable(name);
+                tableId = _schema.CreateTable(name);
                 var table = new AppTable { Id = tableId, Name = name };
                 for (int i = 0; i < columnCount; i++)
                 {
@@ -81,7 +82,7 @@ namespace DataManager.Services
                 tx.Complete();
             }
 
-            return name;
+            return tableId;
         }
 
         /// <summary>

@@ -499,23 +499,12 @@ namespace DataManager
 
             try
             {
-                string tableName = Data.Csv.ImportAsNewTable(dialog.FileName, new List<AppTable>(Data.Tables));
+                long createdId = Data.Csv.ImportAsNewTable(dialog.FileName, new List<AppTable>(Data.Tables));
 
                 Data.ReloadTables();
                 LoadWorkCopy();
                 MarkDirty();
                 RefreshTableList();
-
-                // 选中刚导入的表
-                long createdId = 0;
-                foreach (AppTable t in _work)
-                {
-                    if (string.Equals(t.Name, tableName, StringComparison.Ordinal))
-                    {
-                        createdId = t.Id;
-                        break;
-                    }
-                }
 
                 if (createdId != 0)
                 {
