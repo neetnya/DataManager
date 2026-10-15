@@ -1723,6 +1723,12 @@ namespace DataManager
                     return;
                 }
 
+                if (Data.Schema.TagNameExists(_table.Id, input, tag.Id))
+                {
+                    MessageWindow.Show(this, "该表已有同名标签。", "重命名标签", Dialogs.MessageTone.Warning);
+                    return;
+                }
+
                 Data.Schema.RenameTag(tag.Id, input);
 
                 // 正在按旧名筛选时同步切换

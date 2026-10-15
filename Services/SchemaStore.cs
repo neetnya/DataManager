@@ -446,6 +446,19 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
             return new Tag { Id = _db.LastInsertRowId, TableId = tableId, Name = name };
         }
 
+        /// <summary>本表是否已有同名标签（可排除正在改名的那一条）。</summary>
+        public bool TagNameExists(long tableId, string name, long excludeTagId)
+        {
+            using (SqliteStatement st = _db.Prepare(
+                "SELECT 1 FROM meta_tag WHERE table_id = ? AND name = ? AND id <> ? LIMIT 1"))
+            {
+                st.Bind(1, tableId);
+                st.Bind(2, name);
+                st.Bind(3, excludeTagId);
+                return st.Read();
+            }
+        }
+
         /// <summary>重命名标签（本表内全局生效）。</summary>
         public void RenameTag(long tagId, string newName)
         {

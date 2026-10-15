@@ -361,6 +361,12 @@ namespace DataManager
                     return;
                 }
 
+                if (_data.Schema.TagNameExists(_table.Id, input, tag.Id))
+                {
+                    MessageWindow.Show(this, "该表已有同名标签。", "重命名标签", MessageTone.Warning);
+                    return;
+                }
+
                 _data.Schema.RenameTag(tag.Id, input);
                 Changed = true;
                 RebuildTagRows();
