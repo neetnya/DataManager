@@ -208,6 +208,7 @@ namespace DataManager
         private bool _committed;
         private bool _suppressSelection;
         private bool _transactionOpen;
+        private readonly AppSettings _appearanceSnapshot;
 
         /// <summary>是否真的保存过（供主窗口判断是否需要刷新）。</summary>
         public bool SettingsChanged { get; private set; }
@@ -223,6 +224,9 @@ namespace DataManager
             _transactionOpen = true;
 
             LoadWorkCopy();
+
+            // 外观/分组分隔符会即时写进 App.Settings；取消时按打开窗口时的快照回滚
+            _appearanceSnapshot = App.Settings.Clone();
 
             Loaded += OnLoaded;
             Closing += OnClosing;
@@ -1115,13 +1119,24 @@ namespace DataManager
                 _committed = true;
                 SettingsChanged = true;
                 Data.ReloadTables();
-                return true;
             }
             catch (Exception ex)
             {
                 MessageWindow.Show(this, "保存设置失败：\n\n" + ex.Message, "保存失败", Dialogs.MessageTone.Danger);
                 return false;
             }
+
+            try
+            {
+                SettingsService.Save(App.Settings);
+            }
+            catch (Exception ex)
+            {
+                MessageWindow.Show(this, "表结构已保存，但写入 config.json 失败：\n\n" + ex.Message,
+                    "保存设置", Dialogs.MessageTone.Warning);
+            }
+
+            return true;
         }
 
         private void OnCancel(object sender, RoutedEventArgs e)
@@ -1182,6 +1197,9 @@ namespace DataManager
             {
                 // 回滚失败时忽略
             }
+
+            App.Settings.CopyAppearanceFrom(_appearanceSnapshot);
+            AppearanceChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 }

@@ -106,6 +106,26 @@ namespace DataManager.Services
         }
 
         /// <summary>
+        /// 只覆盖外观与分组分隔符（设置窗口实时预览会改这两类字段）。
+        /// 不碰 WebDAV、列宽、窗口尺寸，避免取消设置时把别处已保存的配置冲掉。
+        /// </summary>
+        public void CopyAppearanceFrom(AppSettings source)
+        {
+            if (source == null)
+            {
+                return;
+            }
+
+            GridFontFamily = source.GridFontFamily;
+            GridFontSize = source.GridFontSize;
+            GridFontBold = source.GridFontBold;
+            GridFontItalic = source.GridFontItalic;
+            GridRowHeight = source.GridRowHeight;
+            GridShowLines = source.GridShowLines;
+            GroupSeparator = source.GroupSeparator;
+        }
+
+        /// <summary>
         /// 把老配置迁移到新字段：旧版用固定文件名（WebDavFileName），
         /// 新版改为“前缀 + 时间戳”。这里把旧文件名去掉扩展名后当前缀，
         /// 这样用户原来的命名习惯（例如 MyData）能保留下来。
