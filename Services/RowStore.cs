@@ -520,11 +520,10 @@ namespace DataManager.Services
                     }
                 }
 
+                _schema.RemoveRowLinks(table.Id, rowIds);
+                ReconcileGroupsAfterWrite(table);
                 tx.Complete();
             }
-
-            _schema.RemoveRowLinks(table.Id, rowIds);
-            ReconcileGroupsAfterWrite(table);
         }
 
         // ---------------------------------------------------------------
