@@ -1327,7 +1327,7 @@ namespace DataManager
         }
 
         /// <summary>
-        /// 粘贴：从锚点单元格开始按块填涂，只修改有值的单元格；
+        /// 粘贴：从锚点单元格开始按块填涂，空值会清空目标单元格；
         /// 唯一约束冲突时整体回滚并提示。
         /// </summary>
         private void PasteAtSelection()
@@ -1400,7 +1400,8 @@ namespace DataManager
                     }
 
                     string value = block[r][c] ?? string.Empty;
-                    if (value.Length == 0)
+                    string old = row.Cells[targetCol].Value ?? string.Empty;
+                    if (string.Equals(old, value, StringComparison.Ordinal))
                     {
                         continue;
                     }
@@ -1447,11 +1448,12 @@ namespace DataManager
                 foreach ((RowVm row, int col, string value) in pending)
                 {
                     string old = row.Cells[col].Value ?? string.Empty;
-                    Data.Connection.Execute(
-                        "UPDATE " + Sql.Ident(_table.PhysicalName) + " SET " +
-                        Sql.Ident(_table.Columns[col].PhysicalName) + " = ? WHERE rid = ?",
-                        value,
-                        row.RowId.ToString(CultureInfo.InvariantCulture));
+                    string error = Data.Rows.UpdateCell(_table, row.RowId, _table.Columns[col], value);
+                    if (error != null)
+                    {
+                        MessageWindow.Show(this, error, "无法粘贴", Dialogs.MessageTone.Warning);
+                        return;
+                    }
 
                     row.Cells[col].Value = value;
                     PushUndo(row.RowId, col, old, value);
