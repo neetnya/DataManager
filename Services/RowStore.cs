@@ -179,18 +179,18 @@ namespace DataManager.Services
 
         /// <summary>
         /// 标签过滤：命中“归属该行的标签”，或“归属该行所在分组值的标签”。
+        /// 按标签名精确匹配（点哪个标签就筛哪个，不会把「测试2」算进「测试」）。
         /// </summary>
-        private string BuildTagFilterClause(AppTable table, string keyword, List<string> args)
+        private string BuildTagFilterClause(AppTable table, string tagName, List<string> args)
         {
             string tid = table.Id.ToString(CultureInfo.InvariantCulture);
             string physical = Sql.Ident(table.PhysicalName);
-            string like = "%" + Sql.EscapeLike(keyword) + "%";
 
             var sb = new StringBuilder();
             sb.Append("rid IN (SELECT l.row_id FROM meta_tag_link l JOIN meta_tag g ON g.id = l.tag_id ");
-            sb.Append("WHERE l.table_id = ? AND l.scope = 0 AND g.name LIKE ? ESCAPE '\\')");
+            sb.Append("WHERE l.table_id = ? AND l.scope = 0 AND g.name = ?)");
             args.Add(tid);
-            args.Add(like);
+            args.Add(tagName);
 
             // 分组值归属：该行的某个分组列的当前值（可能含多个分组），
             // 正好是某个被打标签的分组值
@@ -206,11 +206,11 @@ namespace DataManager.Services
 
                 sb.Append(" OR rid IN (SELECT r0.rid FROM ").Append(physical).Append(" r0 ")
                   .Append("JOIN (SELECT l.group_value FROM meta_tag_link l JOIN meta_tag g ON g.id = l.tag_id ")
-                  .Append("WHERE l.table_id = ? AND l.scope = 1 AND l.column_id = ? AND g.name LIKE ? ESCAPE '\\') l ON 1=1 ")
+                  .Append("WHERE l.table_id = ? AND l.scope = 1 AND l.column_id = ? AND g.name = ?) l ON 1=1 ")
                   .Append("WHERE ").Append(match).Append(")");
                 args.Add(tid);
                 args.Add(c.Id.ToString(CultureInfo.InvariantCulture));
-                args.Add(like);
+                args.Add(tagName);
             }
 
             return "(" + sb + ")";
