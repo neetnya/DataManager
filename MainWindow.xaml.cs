@@ -1761,6 +1761,20 @@ namespace DataManager
             var delete = new MenuItem { Header = "删除标签" };
             delete.Click += (s, args) =>
             {
+                int rows = CountRowsUsingTag(tag);
+                if (!MessageWindow.Confirm(
+                        this,
+                        "删除标签「" + tag.Name + "」？\n\n" +
+                        "该标签目前被 " + rows.ToString(CultureInfo.InvariantCulture) +
+                        " 行使用，删除后这些行上的标记会消失。\n" +
+                        "表格里的数据本身不受影响。",
+                        "删除标签",
+                        MessageTone.Danger,
+                        MessageButtons.OkCancel))
+                {
+                    return;
+                }
+
                 Data.Schema.DeleteTag(tag.Id);
 
                 if (string.Equals(_spec.TagFilter, tag.Name, StringComparison.Ordinal))
@@ -1776,6 +1790,65 @@ namespace DataManager
             menu.Items.Add(unlink);
             menu.Items.Add(delete);
             menu.IsOpen = true;
+        }
+
+        /// <summary>该标签在整张表里被多少行用到（分组标签算同组所有行）。</summary>
+        private int CountRowsUsingTag(Tag tag)
+        {
+            if (_table == null)
+            {
+                return 0;
+            }
+
+            List<TagLink> links = Data.Schema.LoadTagLinks(_table.Id);
+            List<DataRow> all = Data.Rows.Query(_table, new QuerySpec());
+            int count = 0;
+
+            foreach (DataRow r in all)
+            {
+                bool hit = false;
+                foreach (TagLink l in links)
+                {
+                    if (l.TagId != tag.Id)
+                    {
+                        continue;
+                    }
+
+                    if (l.Scope == TagScope.Row)
+                    {
+                        if (l.RowId == r.RowId)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < _table.Columns.Count; i++)
+                        {
+                            AppColumn c = _table.Columns[i];
+                            if (c.Id == l.ColumnId && c.IsGroup &&
+                                GroupValueSplitter.Contains(r.Get(i), l.GroupValue))
+                            {
+                                hit = true;
+                                break;
+                            }
+                        }
+
+                        if (hit)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if (hit)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
 
         /// <summary>右键点单元格时先选中它，保证右键菜单作用在正确的单元格上。</summary>
