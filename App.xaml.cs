@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
@@ -155,7 +156,36 @@ namespace DataManager
             _activateSignal?.Dispose();
             _instanceMutex?.Dispose();
 
+            // 先释放单实例互斥，再拉起新进程，否则新实例会以为旧的还在
+            if (RestartRequested)
+            {
+                TryRelaunch();
+            }
+
             base.OnExit(e);
+        }
+
+        private static void TryRelaunch()
+        {
+            try
+            {
+                string exe = Environment.ProcessPath;
+                if (string.IsNullOrEmpty(exe))
+                {
+                    exe = System.IO.Path.Combine(AppContext.BaseDirectory, "DataManager.exe");
+                }
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exe,
+                    WorkingDirectory = AppContext.BaseDirectory,
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception)
+            {
+                // 拉起失败时用户按提示手动再开即可
+            }
         }
     }
 }
