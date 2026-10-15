@@ -107,7 +107,7 @@ namespace DataManager
                 _table = null;
                 _rowSource.Clear();
                 UpdateToolbarState();
-                TxtFooter.Text = "还没有数据表，请点击右上角【设置】创建。";
+                TxtFooter.Text = "还没有数据表，请点击左上角齿轮【设置】创建。";
             }
         }
 
