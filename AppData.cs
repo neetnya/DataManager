@@ -64,6 +64,15 @@ namespace DataManager
             _db.Close();
         }
 
+        /// <summary>关闭后再打开主库。恢复失败时用来把当前会话接回去。</summary>
+        public void ReopenDatabase()
+        {
+            _db.Close();
+            _db.Open(AppPaths.DatabaseFile);
+            Schema.Initialize();
+            ReloadTables();
+        }
+
         public void Dispose()
         {
             _db.Dispose();

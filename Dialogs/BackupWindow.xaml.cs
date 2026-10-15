@@ -541,8 +541,25 @@ namespace DataManager
             }
             catch (Exception ex)
             {
+                try
+                {
+                    Data.ReopenDatabase();
+                }
+                catch (Exception reopenEx)
+                {
+                    App.RestartRequested = true;
+                    MessageWindow.Show(this, "恢复失败：\n\n" + ex.Message + "\n\n" +
+                        "当前数据库也无法重新打开：" + reopenEx.Message + "\n\n" +
+                        (currentBackup != null ? "恢复前的备份仍在：" + currentBackup + "\n\n" : string.Empty) +
+                        "软件将关闭，请重新打开后再试。",
+                        "恢复失败", Dialogs.MessageTone.Danger);
+                    this.CloseWithResult(true);
+                    return;
+                }
+
                 MessageWindow.Show(this, "恢复失败：\n\n" + ex.Message + "\n\n" +
-                    (currentBackup != null ? "恢复前的备份仍在：" + currentBackup : string.Empty),
+                    "已重新打开原来的数据库。" +
+                    (currentBackup != null ? "\n恢复前的备份仍在：" + currentBackup : string.Empty),
                     "恢复失败", Dialogs.MessageTone.Danger);
                 return;
             }

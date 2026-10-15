@@ -108,7 +108,7 @@ namespace DataManager.Services
         {
             int removed = 0;
 
-            foreach (string directory in new[] { AppPaths.BackupDirectory, AppPaths.RestoreStageDirectory })
+            foreach (string directory in new[] { AppPaths.BackupDirectory, AppPaths.RestoreStageDirectory, AppPaths.DataDirectory })
             {
                 string[] files;
                 try
@@ -118,7 +118,9 @@ namespace DataManager.Services
                         continue;
                     }
 
-                    files = Directory.GetFiles(directory, "*.partial");
+                    files = Directory.GetFiles(directory, "*.partial")
+                        .Concat(Directory.GetFiles(directory, "*.replace"))
+                        .ToArray();
                 }
                 catch (Exception)
                 {
@@ -190,6 +192,7 @@ namespace DataManager.Services
         /// <summary>
         /// 用指定的 sqlite 文件替换当前数据库。调用方需保证已关闭数据库连接，
         /// 并在成功后重启软件。
+        /// 先写到同目录的临时文件再 Move 覆盖，避免中断时把主库写成半截。
         /// </summary>
         public static void ReplaceDatabase(string sourceSqlitePath)
         {
@@ -200,17 +203,47 @@ namespace DataManager.Services
 
             AppPaths.EnsureCreated();
 
-            // 目标目录可能残留旧的 -wal / -shm，一并清掉，避免恢复后读到旧数据
-            foreach (string suffix in new[] { "-wal", "-shm", "-journal" })
+            string destination = AppPaths.DatabaseFile;
+            string tmp = destination + ".replace";
+            bool completed = false;
+
+            try
             {
-                string side = AppPaths.DatabaseFile + suffix;
-                if (File.Exists(side))
+                if (File.Exists(tmp))
                 {
-                    File.Delete(side);
+                    File.Delete(tmp);
+                }
+
+                File.Copy(sourceSqlitePath, tmp, true);
+                File.Move(tmp, destination, true);
+                completed = true;
+
+                // 主文件换成新库后再清旧的 -wal / -shm，避免把旧日志套到新文件上
+                foreach (string suffix in new[] { "-wal", "-shm", "-journal" })
+                {
+                    string side = destination + suffix;
+                    if (File.Exists(side))
+                    {
+                        File.Delete(side);
+                    }
                 }
             }
-
-            File.Copy(sourceSqlitePath, AppPaths.DatabaseFile, true);
+            finally
+            {
+                if (!completed && File.Exists(tmp))
+                {
+                    try
+                    {
+                        File.Delete(tmp);
+                    }
+                    catch (IOException)
+                    {
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                    }
+                }
+            }
         }
 
         /// <summary>把数据库备份成临时文件，返回路径（用于恢复前的自动备份）。</summary>
