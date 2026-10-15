@@ -129,11 +129,30 @@ namespace DataManager
                 return;
             }
 
-            Dialogs.MessageWindow.Show(
-                null,
-                "发生了致命错误：\n\n" + ex.Message,
-                "轻量数据管理工具",
-                Dialogs.MessageTone.Danger);
+            void Show()
+            {
+                Dialogs.MessageWindow.Show(
+                    Current?.MainWindow,
+                    "发生了致命错误：\n\n" + ex.Message,
+                    "轻量数据管理工具",
+                    Dialogs.MessageTone.Danger);
+            }
+
+            Dispatcher dispatcher = Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+            {
+                Show();
+                return;
+            }
+
+            try
+            {
+                dispatcher.Invoke(Show);
+            }
+            catch (Exception)
+            {
+                // 调度失败时不再二次抛，避免盖住原始致命错误
+            }
         }
 
         protected override void OnExit(ExitEventArgs e)
