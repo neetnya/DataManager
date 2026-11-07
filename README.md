@@ -2,71 +2,7 @@
 
 ---
 
-## 一、快速开始
-
-```powershell
-# 1) 检查运行环境（本软件不需要安装任何依赖，此脚本只做检查）
-powershell -ExecutionPolicy Bypass -File .\install-deps.ps1
-
-# 2) 构建，产物输出到 .\dist
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-
-# 3) 运行
-.\dist\DataManager.exe
-```
-
-> 如果双击 `.ps1` 提示“禁止运行脚本”，就在 PowerShell 里加上
-> `-ExecutionPolicy Bypass`，或者先执行一次
-> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
-> 所有 `.ps1` 都存成 **UTF-8 with BOM**，保证中文在 Windows PowerShell 5.1 下不乱码。
-
-运行环境要求：**Windows 10 或更高版本** + **.NET 9 桌面运行时**。
-
----
-
-## 二、关于依赖（重要）
-
-**本软件不引用任何 NuGet 包**，因此不需要联网、也不需要执行任何安装命令。做法：
-
-| 需要的能力 | 实现方式 |
-|---|---|
-| SQLite 存储 | P/Invoke 调用 **Windows 10 自带的 `winsqlite3.dll`**（系统内置 SQLite 3.43.2），完全不用 `Microsoft.Data.Sqlite` / `SQLitePCLRaw` |
-| WebDAV 上传下载 | BCL 的 `System.Net.Http` + 手写 `PROPFIND` XML 解析（`System.Xml.Linq`） |
-| 界面 | WPF（`Microsoft.WindowsDesktop.App` 共享框架，随 .NET 运行时提供） |
-| CSV 读写 | 自行实现（RFC 4180），非 UTF-8 编码用 Win32 `MultiByteToWideChar` 解码 |
-| 配置读写 | `System.Text.Json`（BCL 内置） |
-
----
-
-## 三、目录结构
-
-源码直接放在项目根目录（没有 `src/` 嵌套），与 README 平级：
-
-```
-DataManager/
-├─ DataManager.csproj       工程文件（零 NuGet 依赖）
-├─ App.xaml(.cs)            程序入口、单实例、全局异常
-├─ AppData.cs               应用级数据入口
-├─ MainWindow.xaml(.cs)     主窗口
-├─ Interop/                 winsqlite3.dll 的 P/Invoke 声明
-├─ Data/                    轻量 SQLite 封装（连接、语句、事务、在线备份）
-├─ Models/                  表 / 列 / 行 / 标签
-├─ Services/                业务：表结构、行查询、CSV、WebDAV、备份、配置
-├─ ViewModels/              界面绑定对象
-├─ Themes/Theme.xaml        总体样式
-├─ Dialogs/                 设置 / 备份恢复 / 添加数据 / 添加标签 / 输入框 / 自绘消息框
-├─ build.ps1                构建脚本（发布到 dist，**不会删除 dist 里的用户数据**）
-├─ install-deps.ps1         运行环境检查脚本
-├─ README.md                本文件
-```
-
-> ⚠️ **`build.ps1` 的注意事项**
-> - `build.ps1` 只清理 `dist` 里的**程序文件**，`Data\`、`Backup\`、`config.json` 会原样保留，发布后还会做一次校验。
-> - 含中文的 `.ps1` **必须存成 UTF-8 with BOM**：PowerShell 5.1 会把无 BOM 的 `.ps1` 当 ANSI 读，中文乱码还可能把两行粘成一行，导致逻辑静默失效（曾经因此把 `dist` 里的用户数据整个删掉）。
-
----
-
-## 四、数据存放
+## 数据存放
 
 所有数据都在**软件目录**下（与 `DataManager.exe` 同级）：
 
@@ -78,39 +14,7 @@ DataManager/
 
 ---
 
-## 五、数据库设计（第 14 条待确认项的落地）
-
-### 5.1 元数据表
-
-| 表 | 用途 |
-|---|---|
-| `meta_table` | 表清单（`id` / `name` / `sort_order`）。表名允许重复 |
-| `meta_column` | 列配置（`ordinal` / `col_name` / 5 个标记位 / `sort_desc` / `sort_prio`） |
-| `meta_tag` | 标签，`(table_id, name)` 唯一 |
-| `meta_tag_link` | 标签绑定：`scope=0` 归属行，`scope=1` 归属分组值 |
-
-### 5.2 动态 DDL 的映射规则
-
-- 第 N 张用户表 → 真实表 **`t_<id>`**（用 `meta_table.id`，与表名无关，所以表名可以随便重名）
-- 第 K 列 → 真实列 **`c<K>`**，列名存在 `meta_column.col_name`
-- **物理列名一旦分配就永不复用、永不重编号**：删掉 `c1` 后新加的列是 `c3`，不会是 `c1`。
-  这样删列/调序都不需要搬动任何数据，也不会出现列错位。
-- 每一行有 `rid INTEGER PRIMARY KEY AUTOINCREMENT` 作为稳定行标识，标签靠它定位。
-- 所有列都是 `TEXT`（需求：全是字符串），空字符串统一存成 SQL `NULL`（便于“空值不参与唯一”）。
-
-### 5.3 排序优先级
-
-`meta_column.sort_prio` 保存用户自定义的固定排序优先级，数字小的先排，同值回落到建表顺序。
-`ORDER BY` 只在查询时拼进 SQL，**除设置里的排序外不提供任何其他排序操作**（点列头不会排序）。
-没有勾选任何排序列时按 `rid` 排序，保证结果稳定。
-
-### 5.4 本地备份保留策略
-
-`config.json` 的 `BackupKeepCount`，**默认 0 = 保留全部**；可在“备份 / 恢复”窗口里改成保留最近 N 份并立即清理。
-
----
-
-## 六、功能与需求的对应关系
+## 功能与需求的对应关系
 
 ### 主界面
 - **打开即最大化**（关闭时记住的是普通状态下的窗口尺寸，取消最大化后回到这个大小）
@@ -262,7 +166,7 @@ WebDAV 的 **PUT 不会自动创建中间目录**。往一个不存在的目录�
 
 ---
 
-## 七、界面上的提示文本说明
+## 界面上的提示文本说明
 
 按需求，软件里除了**必要的确认与报错**外不放说明性文字，相关说明统一写在本 README：
 
