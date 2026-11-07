@@ -236,8 +236,11 @@ namespace DataManager.Services
                 " OR " + cellExpr + " LIKE ('%' || " + sepLit + " || " + valueExpr + ") ESCAPE '\\')";
         }
 
-        /// <summary>按条件读取数据行（固定排序在此生效）。</summary>
-        public List<DataRow> Query(AppTable table, QuerySpec spec)
+        /// <summary>
+        /// 按条件读取数据行。参数 applySort 为 true 时应用固定排序；
+        /// 传 false 时按插入顺序返回（是否重排由调用方决定）。
+        /// </summary>
+        public List<DataRow> Query(AppTable table, QuerySpec spec, bool applySort = true)
         {
             var args = new List<string>();
             string sql = "SELECT rid";
@@ -248,7 +251,10 @@ namespace DataManager.Services
 
             sql += " FROM " + Physical(table);
             sql += BuildWhere(table, spec, args);
-            sql += BuildOrderBy(table);
+            if (applySort)
+            {
+                sql += BuildOrderBy(table);
+            }
 
             var rows = new List<DataRow>();
             using (SqliteStatement st = _db.Prepare(sql))

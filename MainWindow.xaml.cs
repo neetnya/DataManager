@@ -33,6 +33,12 @@ namespace DataManager
         private string _editingOriginal;
         private int _rightClickColumnIndex = -1;
 
+        /// <summary>
+        /// 当前表的显示顺序（行 Id）。固定排序只在打开软件/切换数据表时重算，
+        /// 之后的编辑、增删、筛选都沿用这份顺序，避免行位置跳动。
+        /// </summary>
+        private readonly List<long> _displayOrder = new List<long>();
+
         /// <summary>撤销历史：一次单元格修改（含粘贴的每个单元格）记一条，最多保留 10 步。</summary>
         private readonly List<UndoEntry> _undoStack = new List<UndoEntry>();
         private const int MaxUndoSteps = 10;
@@ -133,7 +139,7 @@ namespace DataManager
             _spec = new QuerySpec();
 
             BuildColumns();
-            ReloadRows();
+            ReloadRows(true);
             RebuildTagBar();
             UpdateToolbarState();
         }
@@ -540,12 +546,17 @@ namespace DataManager
         // 载入数据
         // =================================================================
 
-        private void ReloadRows()
+        /// <summary>
+        /// 刷新行视图。resort 为 true 时按固定排序重排（只在软件打开/切换数据表时使用）；
+        /// 其余刷新沿用当前显示顺序，避免编辑、增删行时位置乱跳。
+        /// </summary>
+        private void ReloadRows(bool resort = false)
         {
             _rowSource.Clear();
 
             if (_table == null)
             {
+                _displayOrder.Clear();
                 return;
             }
 
@@ -565,7 +576,39 @@ namespace DataManager
                 }
             }
 
-            List<DataRow> rows = Data.Rows.Query(_table, _spec);
+            List<DataRow> rows = Data.Rows.Query(_table, _spec, resort);
+
+            // 固定排序只在打开软件/切换数据表（resort == true）时重算；
+            // 其余刷新按已有的显示顺序稳定排列，新行排在末尾。
+            if (resort)
+            {
+                _displayOrder.Clear();
+                foreach (DataRow r in rows)
+                {
+                    _displayOrder.Add(r.RowId);
+                }
+            }
+            else
+            {
+                var positions = new Dictionary<long, int>(_displayOrder.Count);
+                for (int i = 0; i < _displayOrder.Count; i++)
+                {
+                    positions[_displayOrder[i]] = i;
+                }
+
+                rows = rows
+                    .OrderBy(r => positions.TryGetValue(r.RowId, out int position) ? position : int.MaxValue)
+                    .ToList();
+
+                var known = new HashSet<long>(_displayOrder);
+                foreach (DataRow r in rows)
+                {
+                    if (known.Add(r.RowId))
+                    {
+                        _displayOrder.Add(r.RowId);
+                    }
+                }
+            }
             var links = Data.Schema.LoadTagLinks(_table.Id);
 
             // 归属行的标签
@@ -2129,18 +2172,25 @@ namespace DataManager
             switch (result.Outcome)
             {
                 case QuickQueryOutcome.Exact:
-                    try
+                {
+                    // 被查询列的结果为 "/" 时视为空占位，不自动覆盖剪贴板
+                    string clipboardValue = result.ClipboardValue ?? string.Empty;
+                    if (clipboardValue.Trim() != "/")
                     {
-                        Clipboard.SetText(result.ClipboardValue ?? string.Empty);
-                    }
-                    catch (Exception)
-                    {
-                        MessageWindow.Show(this, "查询到结果，但写入剪贴板失败。", "快捷查询", Dialogs.MessageTone.Warning);
+                        try
+                        {
+                            Clipboard.SetText(clipboardValue);
+                        }
+                        catch (Exception)
+                        {
+                            MessageWindow.Show(this, "查询到结果，但写入剪贴板失败。", "快捷查询", Dialogs.MessageTone.Warning);
+                        }
                     }
 
                     ClearAllFilters();
                     JumpToRow(result.RowId);
                     break;
+                }
 
                 case QuickQueryOutcome.Fuzzy:
                     _spec.QuickFilterColumnId = result.FilterColumn.Id;
