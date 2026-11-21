@@ -1,4 +1,5 @@
 using System.Windows;
+using DataManager.Dialogs;
 
 namespace DataManager
 {
@@ -21,11 +22,16 @@ namespace DataManager
         /// <summary>弹出输入框。取消返回 null。</summary>
         public static string Show(Window owner, string title, string prompt, string initial)
         {
+            if (DialogService.Suppressed)
+            {
+                return null;
+            }
+
             var dialog = new InputDialog
             {
-                Owner = owner,
                 Title = title,
             };
+            dialog.ApplyOwner(owner);
 
             dialog.TxtPrompt.Text = prompt;
             dialog.TxtValue.Text = initial ?? string.Empty;

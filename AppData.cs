@@ -16,16 +16,24 @@ namespace DataManager
 
         public AppData()
         {
-            AppPaths.EnsureCreated();
-            _db.Open(AppPaths.DatabaseFile);
+            try
+            {
+                AppPaths.EnsureCreated();
+                _db.Open(AppPaths.DatabaseFile);
 
-            Schema = new SchemaStore(_db);
-            Schema.Initialize();
+                Schema = new SchemaStore(_db);
+                Schema.Initialize();
 
-            Rows = new RowStore(_db, Schema);
-            Csv = new CsvTransferService(_db, Schema, Rows);
+                Rows = new RowStore(_db, Schema);
+                Csv = new CsvTransferService(_db, Schema, Rows);
 
-            ReloadTables();
+                ReloadTables();
+            }
+            catch
+            {
+                _db.Dispose();
+                throw;
+            }
         }
 
         public SqliteConnection Connection => _db;

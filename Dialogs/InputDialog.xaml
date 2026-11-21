@@ -7,6 +7,7 @@
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <StackPanel Margin="18">

@@ -7,6 +7,28 @@ namespace DataManager
     public static class WindowHelper
     {
         /// <summary>
+        /// 设置窗口的 Owner 与初始位置：有 Owner 时居中于父窗口，
+        /// Owner 为 null 时回退到屏幕居中，避免窗口落在左上角。
+        /// </summary>
+        public static void ApplyOwner(this Window window, Window owner)
+        {
+            if (window == null)
+            {
+                return;
+            }
+
+            if (owner != null)
+            {
+                window.Owner = owner;
+                window.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            }
+            else
+            {
+                window.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            }
+        }
+
+        /// <summary>
         /// 关闭窗口并把结果回传给调用方。
         /// DialogResult 只能在通过 ShowDialog 显示的窗口上设置，
         /// 用 Show 显示时会抛 InvalidOperationException，这里统一兜底。

@@ -43,6 +43,7 @@
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
                     <Button x:Name="BtnAddRow"
                             Content="添加"
+                            ToolTip="添加新行 (Ctrl+N)"
                             Click="OnAddRow"
                             Margin="0,0,8,0" />
                     <Button x:Name="BtnAddTag"
@@ -56,12 +57,14 @@
                             Margin="0,0,8,0" />
                     <Button x:Name="BtnQuickQuery"
                             Content="快捷查询"
+                            ToolTip="快捷查询 (Ctrl+F)"
                             Style="{StaticResource PrimaryButton}"
                             Click="OnQuickQuery"
                             Margin="0,0,8,0"
                             Visibility="Collapsed" />
                     <Button x:Name="BtnClearFilter"
                             Content="清除筛选"
+                            ToolTip="清除所有筛选 (Ctrl+Shift+C)"
                             Click="OnClearFilter"
                             Visibility="Collapsed" />
                 </StackPanel>
@@ -114,21 +117,21 @@
             <Grid Grid.Column="2">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <!-- 标签展示条 -->
                 <Border x:Name="TagBar"
-                        Grid.Row="1"
+                        Grid.Row="0"
+                        MaxHeight="84"
                         Background="#F8FAFD"
                         BorderBrush="{StaticResource BorderBrush}"
                         BorderThickness="0,0,0,1"
-                        Padding="12,7"
+                        Padding="12,7,12,1"
                         Visibility="Collapsed">
-                    <ScrollViewer HorizontalScrollBarVisibility="Auto"
-                                  VerticalScrollBarVisibility="Disabled">
+                    <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                                  VerticalScrollBarVisibility="Auto">
                         <ItemsControl x:Name="TagBarItems">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
@@ -141,7 +144,7 @@
 
                 <!-- 表格 -->
                 <DataGrid x:Name="Grid"
-                          Grid.Row="2"
+                          Grid.Row="1"
                           Margin="12,10,12,10"
                           AutoGenerateColumns="False"
                           CanUserAddRows="False"
@@ -172,6 +175,11 @@
                     </DataGrid.RowHeaderStyle>
                     <DataGrid.ContextMenu>
                         <ContextMenu x:Name="CellMenu">
+                            <MenuItem x:Name="MenuEditRow"
+                                      Header="编辑整行"
+                                      InputGestureText="F2 / Ctrl+E"
+                                      Click="OnEditRow" />
+                            <Separator />
                             <MenuItem x:Name="MenuAddTag"
                                       Header="添加标签"
                                       Click="OnAddTag" />
@@ -180,15 +188,17 @@
                                       Visibility="Collapsed" />
                             <Separator />
                             <MenuItem Header="复制"
+                                      InputGestureText="Ctrl+C"
                                       Click="OnMenuCopy" />
                             <MenuItem Header="删除行"
+                                      InputGestureText="Delete"
                                       Click="OnDeleteRows" />
                         </ContextMenu>
                     </DataGrid.ContextMenu>
                 </DataGrid>
 
                 <TextBlock x:Name="TxtEmptyHint"
-                           Grid.Row="2"
+                           Grid.Row="1"
                            Text="还没有数据。点击【添加】新增一行。"
                            Foreground="{StaticResource TextFaintBrush}"
                            FontSize="13"
@@ -198,7 +208,7 @@
                            Visibility="Collapsed" />
 
                 <!-- 底部：行数统计 -->
-                <Border Grid.Row="3"
+                <Border Grid.Row="2"
                         Background="{StaticResource SurfaceBrush}"
                         BorderBrush="{StaticResource BorderBrush}"
                         BorderThickness="0,1,0,0"

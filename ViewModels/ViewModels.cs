@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using DataManager.Models;
 
 namespace DataManager.ViewModels
@@ -11,7 +12,7 @@ namespace DataManager.ViewModels
     {
         public event PropertyChangedEventHandler PropertyChanged;
 
-        protected void Raise(string name)
+        protected void Raise([CallerMemberName] string name = null)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
         }
@@ -21,6 +22,7 @@ namespace DataManager.ViewModels
     public sealed class CellVm : ObservableObject
     {
         private string _value;
+        private List<string> _groupCandidates = new List<string>();
 
         public CellVm(int ordinal, string value, bool isGroup, bool isUnique)
         {
@@ -37,7 +39,19 @@ namespace DataManager.ViewModels
         public bool IsUnique { get; }
 
         /// <summary>分组列的候选值（去重后），供编辑时下拉选择。</summary>
-        public List<string> GroupCandidates { get; set; } = new List<string>();
+        public List<string> GroupCandidates
+        {
+            get => _groupCandidates;
+            set
+            {
+                List<string> next = value ?? new List<string>();
+                if (!ReferenceEquals(_groupCandidates, next))
+                {
+                    _groupCandidates = next;
+                    Raise();
+                }
+            }
+        }
 
         public string Value
         {
@@ -61,9 +75,15 @@ namespace DataManager.ViewModels
         public void RefreshGroupTags(IEnumerable<Tag> tags)
         {
             GroupTags.Clear();
-            foreach (Tag t in tags)
+            if (tags != null)
             {
-                GroupTags.Add(t);
+                foreach (Tag t in tags)
+                {
+                    if (t != null)
+                    {
+                        GroupTags.Add(t);
+                    }
+                }
             }
 
             Raise(nameof(HasGroupTags));
@@ -129,9 +149,15 @@ namespace DataManager.ViewModels
         public void RefreshRowTags(IEnumerable<Tag> tags)
         {
             RowTags.Clear();
-            foreach (Tag t in tags)
+            if (tags != null)
             {
-                RowTags.Add(t);
+                foreach (Tag t in tags)
+                {
+                    if (t != null)
+                    {
+                        RowTags.Add(t);
+                    }
+                }
             }
 
             Raise(nameof(HasRowTags));

@@ -208,7 +208,7 @@ namespace DataManager
         private bool _committed;
         private bool _suppressSelection;
         private bool _transactionOpen;
-        private readonly AppSettings _appearanceSnapshot;
+        private AppSettings _appearanceSnapshot;
 
         /// <summary>是否真的保存过（供主窗口判断是否需要刷新）。</summary>
         public bool SettingsChanged { get; private set; }
@@ -259,7 +259,6 @@ namespace DataManager
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
             BuildAppearanceControls();
-            TxtGroupSeparator.Text = App.Settings.GroupSeparator ?? string.Empty;
             RefreshTableList();
             if (TableList.Items.Count > 0)
             {
@@ -306,16 +305,19 @@ namespace DataManager
                 }
             }
 
+            CmbFontFamily.Items.Clear();
             foreach (string name in families)
             {
                 CmbFontFamily.Items.Add(name);
             }
 
+            CmbFontSize.Items.Clear();
             foreach (double size in new[] { 11.0, 12.0, 12.5, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0 })
             {
                 CmbFontSize.Items.Add(size.ToString("0.#", CultureInfo.InvariantCulture));
             }
 
+            CmbRowHeight.Items.Clear();
             foreach (double h in new[] { 24.0, 26.0, 28.0, 30.0, 32.0, 36.0, 40.0, 46.0, 52.0 })
             {
                 CmbRowHeight.Items.Add(h.ToString("0.#", CultureInfo.InvariantCulture));
@@ -344,6 +346,7 @@ namespace DataManager
             ChkBold.IsChecked = s.GridFontBold;
             ChkItalic.IsChecked = s.GridFontItalic;
             ChkShowLines.IsChecked = s.GridShowLines;
+            TxtGroupSeparator.Text = s.GroupSeparator ?? string.Empty;
 
             _suppressAppearanceEvents = false;
             _appearanceReady = true;
@@ -359,6 +362,11 @@ namespace DataManager
         /// <summary>分组分隔符改动：立即写回内存配置并标记未保存。</summary>
         private void OnGroupSeparatorChanged(object sender, TextChangedEventArgs e)
         {
+            if (!_appearanceReady || _suppressAppearanceEvents)
+            {
+                return;
+            }
+
             App.Settings.GroupSeparator = TxtGroupSeparator.Text ?? string.Empty;
             MarkDirty();
         }
@@ -499,10 +507,24 @@ namespace DataManager
 
             try
             {
-                long createdId = Data.Csv.ImportAsNewTable(dialog.FileName, new List<AppTable>(Data.Tables));
+                FlushCurrentColumns();
+
+                long createdId = Data.Csv.ImportAsNewTable(dialog.FileName, new List<AppTable>(_work));
 
                 Data.ReloadTables();
-                LoadWorkCopy();
+                AppTable created = Data.FindTable(createdId);
+                if (created != null)
+                {
+                    var copy = new AppTable { Id = created.Id, Name = created.Name };
+                    foreach (AppColumn c in created.Columns.OrderBy(x => x.Ordinal).ThenBy(x => x.Id))
+                    {
+                        copy.Columns.Add(c.Clone());
+                    }
+
+                    _work.Add(copy);
+                    _columnCache[copy.Id] = new List<AppColumn>(copy.Columns);
+                }
+
                 MarkDirty();
                 RefreshTableList();
 
@@ -531,7 +553,9 @@ namespace DataManager
 
         private void OnExportCsv(object sender, RoutedEventArgs e)
         {
-            if (Data.Tables.Count == 0)
+            FlushCurrentColumns();
+
+            if (_work.Count == 0)
             {
                 return;
             }
@@ -555,7 +579,22 @@ namespace DataManager
 
             try
             {
-                List<string> written = Data.Csv.ExportAll(new List<AppTable>(Data.Tables), directory);
+                var exportTables = new List<AppTable>(_work.Count);
+                foreach (AppTable table in _work)
+                {
+                    var snapshot = new AppTable { Id = table.Id, Name = table.Name };
+                    List<AppColumn> cols = _columnCache.TryGetValue(table.Id, out List<AppColumn> cached)
+                        ? cached
+                        : table.Columns;
+                    foreach (AppColumn c in cols.OrderBy(x => x.Ordinal).ThenBy(x => x.Id))
+                    {
+                        snapshot.Columns.Add(c);
+                    }
+
+                    exportTables.Add(snapshot);
+                }
+
+                List<string> written = Data.Csv.ExportAll(exportTables, directory);
                 MessageWindow.Show(
                     this,
                     "已导出 " + written.Count.ToString(CultureInfo.InvariantCulture) + " 个 CSV 到：\n" + directory,
@@ -570,26 +609,70 @@ namespace DataManager
 
         private void OnOpenBackup(object sender, RoutedEventArgs e)
         {
-            // 备份窗口会直接读写数据库，先把设置窗口的改动落库
-            if (_dirty && !TrySave())
+            // 备份窗口会直接读写数据库，打开前无论是否脏都必须先结束当前事务
+            if (_dirty)
             {
-                return;
+                if (!TrySave())
+                {
+                    return;
+                }
+            }
+            else if (_transactionOpen)
+            {
+                try
+                {
+                    Data.Connection.Rollback();
+                }
+                catch (Exception)
+                {
+                    // 回滚空事务失败忽略
+                }
+
+                _transactionOpen = false;
             }
 
             var window = new BackupWindow { Owner = this };
             window.ShowDialog();
 
-            // 恢复备份后数据库已被替换，连接必须重开
-            if (App.RestartRequested)
+            // 恢复备份后数据库已被替换，按退出动作决定关闭或重启
+            if (App.ExitAction != AppExitAction.None)
             {
+                _committed = true;
                 Application.Current.Shutdown();
+                return;
             }
-            else
+
+            // 未退出：重置脏状态并重新开启设置窗口事务，重新加载最新表结构与外观快照
+            _dirty = false;
+            _committed = false;
+            TxtDirty.Visibility = Visibility.Collapsed;
+
+            if (!_transactionOpen)
             {
-                Data.ReloadTables();
-                LoadWorkCopy();
-                RefreshTableList();
+                Data.Connection.BeginTransaction();
+                _transactionOpen = true;
             }
+
+            _appearanceSnapshot = App.Settings.Clone();
+            LoadWorkCopy();
+            RefreshTableList();
+
+            if (!_currentTableId.HasValue || _work.All(t => t.Id != _currentTableId.Value))
+            {
+                if (TableList.Items.Count > 0)
+                {
+                    _suppressSelection = true;
+                    TableList.SelectedIndex = 0;
+                    _currentTableId = (long)((ListBoxItem)TableList.Items[0]).Tag;
+                    _suppressSelection = false;
+                }
+                else
+                {
+                    _currentTableId = null;
+                }
+            }
+
+            LoadColumns();
         }
 
         // =================================================================
@@ -860,6 +943,7 @@ namespace DataManager
                 table.Columns.Add(created);
 
                 _columnRows.Add(new ColumnEditVm(this, created, _columnRows.Count + 1));
+                Renumber();
                 MarkDirty();
                 UpdateColumnArea();
             }
@@ -899,9 +983,12 @@ namespace DataManager
                 ? "\n该列有 " + nonEmpty.ToString(CultureInfo.InvariantCulture) + " 个非空单元格，会一并删除。"
                 : string.Empty;
 
-            bool confirm = MessageWindow.Confirm(this, "确定要删除【" + vm.Column.DisplayName + "】吗？" + extra,
+            bool confirm = MessageWindow.Confirm(
+                this,
+                "确定要删除【列 " + vm.DisplayOrdinal.ToString(CultureInfo.InvariantCulture) + "】吗？" + extra,
                 "删除列",
-                Dialogs.MessageTone.Danger, Dialogs.MessageButtons.OkCancel);
+                Dialogs.MessageTone.Danger,
+                Dialogs.MessageButtons.OkCancel);
 
             if (!confirm)
             {
@@ -933,6 +1020,7 @@ namespace DataManager
         {
             for (int i = 0; i < _columnRows.Count; i++)
             {
+                _columnRows[i].Column.Ordinal = i;
                 _columnRows[i].DisplayOrdinal = i + 1;
             }
         }
@@ -999,6 +1087,21 @@ namespace DataManager
             }
         }
 
+        /// <summary>对任意表的列集合执行排序优先级归一化。</summary>
+        private static void NormalizeSortPrioritiesForColumns(List<AppColumn> columns)
+        {
+            List<AppColumn> sortable = columns
+                .Where(x => x.IsSort)
+                .OrderBy(x => x.SortPriority)
+                .ThenBy(x => x.Ordinal)
+                .ToList();
+
+            for (int i = 0; i < sortable.Count; i++)
+            {
+                sortable[i].SortPriority = i;
+            }
+        }
+
         // =================================================================
         // 钩子（供 ColumnEditVm 调用）
         // =================================================================
@@ -1054,14 +1157,19 @@ namespace DataManager
         {
             FlushCurrentColumns();
 
+            // 对 _work 中所有表的列集合执行排序优先级归一化
             foreach (AppTable table in _work)
             {
-                if (table.Id != _currentTableId)
-                {
-                    continue;
-                }
+                List<AppColumn> cols = _columnCache.TryGetValue(table.Id, out List<AppColumn> cached)
+                    ? cached
+                    : table.Columns;
 
-                NormalizeSortPriorities();
+                NormalizeSortPrioritiesForColumns(cols);
+            }
+
+            foreach (ColumnEditVm vm in _columnRows)
+            {
+                vm.RaisePriorityChanged();
             }
 
             // 校验每一张表的快捷查询/被查询是否成对

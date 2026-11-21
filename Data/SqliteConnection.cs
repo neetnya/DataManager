@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -52,7 +53,7 @@ namespace DataManager.Data
         /// <summary>列定义名：c0 / c1 / c2 ...</summary>
         public static string ColumnName(int ordinal)
         {
-            return "c" + ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return "c" + ordinal.ToString(CultureInfo.InvariantCulture);
         }
     }
 
@@ -69,10 +70,31 @@ namespace DataManager.Data
             _stmt = stmt;
         }
 
-        internal IntPtr Handle => _stmt;
+        ~SqliteStatement()
+        {
+            Dispose(false);
+        }
+
+        internal IntPtr Handle
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return _stmt;
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed || _stmt == IntPtr.Zero)
+            {
+                throw new ObjectDisposedException(nameof(SqliteStatement));
+            }
+        }
 
         public SqliteStatement Bind(int index, string value)
         {
+            ThrowIfDisposed();
             int rc;
             if (value == null)
             {
@@ -90,6 +112,7 @@ namespace DataManager.Data
 
         public SqliteStatement Bind(int index, long value)
         {
+            ThrowIfDisposed();
             _owner.Check(SqliteNative.sqlite3_bind_int64(_stmt, index, value), "绑定参数失败");
             return this;
         }
@@ -97,6 +120,7 @@ namespace DataManager.Data
         /// <summary>执行一步，返回 SQLITE_ROW / SQLITE_DONE 或抛错。</summary>
         public int Step()
         {
+            ThrowIfDisposed();
             int rc = SqliteNative.sqlite3_step(_stmt);
             if (rc == SqliteNative.SQLITE_ROW || rc == SqliteNative.SQLITE_DONE)
             {
@@ -112,15 +136,24 @@ namespace DataManager.Data
             return Step() == SqliteNative.SQLITE_ROW;
         }
 
-        public int ColumnCount => SqliteNative.sqlite3_column_count(_stmt);
+        public int ColumnCount
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return SqliteNative.sqlite3_column_count(_stmt);
+            }
+        }
 
         public bool IsNull(int index)
         {
+            ThrowIfDisposed();
             return SqliteNative.sqlite3_column_type(_stmt, index) == SqliteNative.SQLITE_NULL;
         }
 
         public string GetString(int index)
         {
+            ThrowIfDisposed();
             if (IsNull(index))
             {
                 return null;
@@ -133,6 +166,7 @@ namespace DataManager.Data
 
         public long GetInt64(int index)
         {
+            ThrowIfDisposed();
             return IsNull(index) ? 0L : SqliteNative.sqlite3_column_int64(_stmt, index);
         }
 
@@ -151,11 +185,18 @@ namespace DataManager.Data
 
         public void Reset()
         {
+            ThrowIfDisposed();
             SqliteNative.sqlite3_reset(_stmt);
             SqliteNative.sqlite3_clear_bindings(_stmt);
         }
 
         public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        private void Dispose(bool disposing)
         {
             if (_disposed)
             {
@@ -163,10 +204,10 @@ namespace DataManager.Data
             }
 
             _disposed = true;
-            if (_stmt != IntPtr.Zero)
+            IntPtr stmt = Interlocked.Exchange(ref _stmt, IntPtr.Zero);
+            if (stmt != IntPtr.Zero)
             {
-                SqliteNative.sqlite3_finalize(_stmt);
-                _stmt = IntPtr.Zero;
+                SqliteNative.sqlite3_finalize(stmt);
             }
         }
     }
@@ -186,7 +227,7 @@ namespace DataManager.Data
             {
                 lock (_gate)
                 {
-                    return _db != IntPtr.Zero;
+                    return !_disposed && _db != IntPtr.Zero;
                 }
             }
         }
@@ -198,7 +239,12 @@ namespace DataManager.Data
             {
                 lock (_gate)
                 {
-                    return _txDepth > 0;
+                    if (_db == IntPtr.Zero)
+                    {
+                        return false;
+                    }
+
+                    return _txDepth > 0 || SqliteNative.sqlite3_get_autocommit(_db) == 0;
                 }
             }
         }
@@ -217,7 +263,7 @@ namespace DataManager.Data
 
         public void Open(string filePath)
         {
-            Open(filePath, SqliteNative.SQLITE_OPEN_READWRITE | SqliteNative.SQLITE_OPEN_CREATE);
+            Open(filePath, SqliteNative.SQLITE_OPEN_READWRITE | SqliteNative.SQLITE_OPEN_CREATE, enableWal: true);
         }
 
         /// <summary>
@@ -226,13 +272,18 @@ namespace DataManager.Data
         /// </summary>
         public void OpenReadOnly(string filePath)
         {
-            Open(filePath, SqliteNative.SQLITE_OPEN_READONLY);
+            Open(filePath, SqliteNative.SQLITE_OPEN_READONLY, enableWal: false);
         }
 
-        private void Open(string filePath, int openFlags)
+        private void Open(string filePath, int openFlags, bool enableWal)
         {
             lock (_gate)
             {
+                if (_disposed)
+                {
+                    throw new ObjectDisposedException(nameof(SqliteConnection));
+                }
+
                 if (_db != IntPtr.Zero)
                 {
                     return;
@@ -257,6 +308,12 @@ namespace DataManager.Data
                 _path = filePath;
                 SqliteNative.sqlite3_extended_result_codes(_db, 1);
                 SqliteNative.sqlite3_busy_timeout(_db, 8000);
+
+                if (enableWal)
+                {
+                    Execute("PRAGMA journal_mode=WAL");
+                    Execute("PRAGMA synchronous=NORMAL");
+                }
             }
         }
 
@@ -267,7 +324,15 @@ namespace DataManager.Data
                 return;
             }
 
-            throw new SqliteException(SqliteNative.sqlite3_extended_errcode(_db), what + "：" + ErrorMessage(_db));
+            lock (_gate)
+            {
+                if (_db == IntPtr.Zero)
+                {
+                    throw new SqliteException(rc, what + "：" + SqliteNative.ErrorText(rc));
+                }
+
+                throw new SqliteException(SqliteNative.sqlite3_extended_errcode(_db), what + "：" + ErrorMessage(_db));
+            }
         }
 
         private static string ErrorMessage(IntPtr db)
@@ -323,7 +388,7 @@ namespace DataManager.Data
             {
                 EnsureOpen();
                 byte[] bytes = SqliteNative.Utf8Z(sql);
-                int rc = SqliteNative.sqlite3_prepare_v2(_db, bytes, -1, out IntPtr stmt, out _);
+                int rc = SqliteNative.sqlite3_prepare_v2(_db, bytes, bytes.Length - 1, out IntPtr stmt, out _);
                 Check(rc, "编译 SQL 失败");
                 if (stmt == IntPtr.Zero)
                 {
@@ -337,111 +402,132 @@ namespace DataManager.Data
         /// <summary>执行不返回结果集的语句。</summary>
         public int Execute(string sql)
         {
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                while (st.Step() == SqliteNative.SQLITE_ROW)
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    // 丢弃结果行
+                    while (st.Step() == SqliteNative.SQLITE_ROW)
+                    {
+                        // 丢弃结果行
+                    }
                 }
-            }
 
-            return Changes;
+                return Changes;
+            }
         }
 
         /// <summary>执行非查询语句，返回受影响行数。</summary>
         public int Execute(string sql, params string[] parameters)
         {
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                for (int i = 0; i < parameters.Length; i++)
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    st.Bind(i + 1, parameters[i]);
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        st.Bind(i + 1, parameters[i]);
+                    }
+
+                    while (st.Step() == SqliteNative.SQLITE_ROW)
+                    {
+                    }
                 }
 
-                while (st.Step() == SqliteNative.SQLITE_ROW)
-                {
-                }
+                return Changes;
             }
-
-            return Changes;
         }
 
         /// <summary>查询并返回全部行（每行为字符串数组，NULL 为 null）。</summary>
         public List<string[]> Query(string sql)
         {
-            var rows = new List<string[]>();
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                while (st.Read())
+                var rows = new List<string[]>();
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    rows.Add(st.GetRow());
+                    while (st.Read())
+                    {
+                        rows.Add(st.GetRow());
+                    }
                 }
-            }
 
-            return rows;
+                return rows;
+            }
         }
 
         public List<string[]> Query(string sql, params string[] parameters)
         {
-            var rows = new List<string[]>();
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                for (int i = 0; i < parameters.Length; i++)
+                var rows = new List<string[]>();
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    st.Bind(i + 1, parameters[i]);
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        st.Bind(i + 1, parameters[i]);
+                    }
+
+                    while (st.Read())
+                    {
+                        rows.Add(st.GetRow());
+                    }
                 }
 
-                while (st.Read())
-                {
-                    rows.Add(st.GetRow());
-                }
+                return rows;
             }
-
-            return rows;
         }
 
         /// <summary>查询单个标量值（首行首列）。</summary>
         public string Scalar(string sql)
         {
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                if (st.Read())
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    return st.GetString(0);
+                    if (st.Read())
+                    {
+                        return st.GetString(0);
+                    }
                 }
-            }
 
-            return null;
+                return null;
+            }
         }
 
         public string Scalar(string sql, params string[] parameters)
         {
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                for (int i = 0; i < parameters.Length; i++)
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    st.Bind(i + 1, parameters[i]);
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        st.Bind(i + 1, parameters[i]);
+                    }
+
+                    if (st.Read())
+                    {
+                        return st.GetString(0);
+                    }
                 }
 
-                if (st.Read())
-                {
-                    return st.GetString(0);
-                }
+                return null;
             }
-
-            return null;
         }
 
         public long ScalarLong(string sql, params string[] parameters)
         {
-            using (SqliteStatement st = Prepare(sql))
+            lock (_gate)
             {
-                for (int i = 0; i < parameters.Length; i++)
+                using (SqliteStatement st = Prepare(sql))
                 {
-                    st.Bind(i + 1, parameters[i]);
-                }
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        st.Bind(i + 1, parameters[i]);
+                    }
 
-                return st.Read() ? st.GetInt64(0) : 0L;
+                    return st.Read() ? st.GetInt64(0) : 0L;
+                }
             }
         }
 
@@ -451,13 +537,14 @@ namespace DataManager.Data
         {
             lock (_gate)
             {
+                EnsureOpen();
                 if (_txDepth == 0)
                 {
                     Execute("BEGIN IMMEDIATE");
                 }
                 else
                 {
-                    Execute("SAVEPOINT sp" + _txDepth);
+                    Execute("SAVEPOINT sp" + _txDepth.ToString(CultureInfo.InvariantCulture));
                 }
 
                 _txDepth++;
@@ -473,8 +560,35 @@ namespace DataManager.Data
                     return;
                 }
 
-                _txDepth--;
-                Execute(_txDepth == 0 ? "COMMIT" : "RELEASE sp" + _txDepth);
+                EnsureOpen();
+
+                // 若底层已被 SQLite 自动回滚而回到 autocommit 模式，先同步状态
+                if (SqliteNative.sqlite3_get_autocommit(_db) != 0)
+                {
+                    _txDepth = 0;
+                    return;
+                }
+
+                int nextDepth = _txDepth - 1;
+                string sql = nextDepth == 0
+                    ? "COMMIT"
+                    : "RELEASE sp" + nextDepth.ToString(CultureInfo.InvariantCulture);
+
+                try
+                {
+                    Execute(sql);
+                }
+                catch
+                {
+                    if (_db != IntPtr.Zero && SqliteNative.sqlite3_get_autocommit(_db) != 0)
+                    {
+                        _txDepth = 0;
+                    }
+
+                    throw;
+                }
+
+                _txDepth = nextDepth;
             }
         }
 
@@ -487,19 +601,40 @@ namespace DataManager.Data
                     return;
                 }
 
-                _txDepth--;
+                int targetDepth = _txDepth - 1;
                 try
                 {
-                    Execute(_txDepth == 0 ? "ROLLBACK" : "ROLLBACK TO sp" + _txDepth);
-                    if (_txDepth > 0)
+                    if (_db != IntPtr.Zero)
                     {
-                        Execute("RELEASE sp" + _txDepth);
+                        if (SqliteNative.sqlite3_get_autocommit(_db) != 0)
+                        {
+                            _txDepth = 0;
+                            return;
+                        }
+
+                        if (targetDepth == 0)
+                        {
+                            Execute("ROLLBACK");
+                        }
+                        else
+                        {
+                            string sp = "sp" + targetDepth.ToString(CultureInfo.InvariantCulture);
+                            Execute("ROLLBACK TO " + sp);
+                            Execute("RELEASE " + sp);
+                        }
                     }
                 }
                 catch (SqliteException)
                 {
-                    // 回滚失败时忽略，交由上层处理
+                    // 回滚失败时忽略，交由上层处理；若底层已回 autocommit 则归零
+                    if (_db != IntPtr.Zero && SqliteNative.sqlite3_get_autocommit(_db) != 0)
+                    {
+                        _txDepth = 0;
+                        return;
+                    }
                 }
+
+                _txDepth = targetDepth;
             }
         }
 
@@ -533,9 +668,9 @@ namespace DataManager.Data
                     return;
                 }
 
-                _done = true;
-                _completed = true;
                 _c.Commit();
+                _completed = true;
+                _done = true;
             }
 
             public void Dispose()
@@ -556,6 +691,11 @@ namespace DataManager.Data
 
         private void EnsureOpen()
         {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(SqliteConnection));
+            }
+
             if (_db == IntPtr.Zero)
             {
                 throw new InvalidOperationException("数据库尚未打开。");
@@ -571,7 +711,7 @@ namespace DataManager.Data
         /// <summary>
         /// 把当前库在线备份到目标文件（线程安全、结果一致）。
         ///
-        /// 先写 “&lt;目标&gt;.partial”，全部成功后才替换目标文件；任何失败都会清掉临时文件，
+        /// 先写 “&lt;目标&gt;.&lt;随机&gt;.partial”，全部成功后才替换目标文件；任何失败都会清掉临时文件，
         /// 因此不会留下 0 字节的残缺备份。
         ///
         /// 关于“自己锁自己”：若本连接上还挂着未提交事务（例如设置窗口打开期间的建表/改列事务），
@@ -590,7 +730,7 @@ namespace DataManager.Data
             {
                 EnsureOpen();
 
-                string tmp = destinationPath + ".partial";
+                string tmp = destinationPath + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".partial";
                 bool completed = false;
 
                 try
@@ -608,7 +748,7 @@ namespace DataManager.Data
                     {
                         IntPtr source = _db;
 
-                        if (_txDepth > 0 && !string.IsNullOrEmpty(_path))
+                        if (HasOpenTransaction && !string.IsNullOrEmpty(_path))
                         {
                             dedicatedSource = new SqliteConnection();
                             dedicatedSource.OpenReadOnly(_path);
@@ -661,7 +801,7 @@ namespace DataManager.Data
         {
             using (var dest = new SqliteConnection())
             {
-                dest.Open(tmpPath);
+                dest.Open(tmpPath, SqliteNative.SQLITE_OPEN_READWRITE | SqliteNative.SQLITE_OPEN_CREATE, enableWal: false);
 
                 IntPtr handle = SqliteNative.sqlite3_backup_init(
                     dest._db, SqliteNative.Utf8Z("main"), sourceHandle, SqliteNative.Utf8Z("main"));
@@ -795,7 +935,7 @@ namespace DataManager.Data
             }
         }
 
-        /// <summary>关闭当前连接（用于恢复备份后重启前释放文件句柄）。</summary>
+        /// <summary>关闭当前连接（用于恢复备份后重启前释放文件句柄，不置 _disposed 以支持重新打开）。</summary>
         public void Close()
         {
             lock (_gate)
@@ -814,13 +954,16 @@ namespace DataManager.Data
 
         public void Dispose()
         {
-            if (_disposed)
+            lock (_gate)
             {
-                return;
-            }
+                if (_disposed)
+                {
+                    return;
+                }
 
-            _disposed = true;
-            Close();
+                _disposed = true;
+                Close();
+            }
         }
     }
 }

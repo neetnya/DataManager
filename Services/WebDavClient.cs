@@ -8,6 +8,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace DataManager.Services
@@ -50,8 +51,10 @@ namespace DataManager.Services
     /// 极简 WebDAV 客户端：只用 .NET 共享框架里的 System.Net.Http，不依赖任何 NuGet 包。
     ///
     /// 设计要点：
-    ///   * 构造时创建一个 HttpClient（PreAuthenticate = false，AllowAutoRedirect = true），
-    ///     Timeout 设为无限，超时由每个请求自己的 CancellationTokenSource 控制（控制类请求默认 100 秒）。
+    ///   * 构造时创建一个 HttpClient（PreAuthenticate = false，AllowAutoRedirect = false），
+    ///     由客户端受控处理重定向（最多 5 次、禁止 https 降级到 http、安全传递认证头）。
+    ///   * Timeout 设为无限，超时由每个请求自己的 CancellationTokenSource 控制（控制类请求默认 100 秒，
+    ///     上传/下载流读写使用 60 秒滑动空闲超时）。
     ///   * 认证使用显式 Authorization: Basic 头（很多 WebDAV 服务器对 Credentials 挑战应答处理不正确）。
     ///   * 所有方法对外都是同步的；内部用 async/await 且处处 ConfigureAwait(false)，因此不会死锁。
     ///   * 上传使用自定义 HttpContent（读取本地文件时按块上报进度）；下载先写同目录临时文件，成功后再覆盖目标文件。
@@ -64,8 +67,23 @@ namespace DataManager.Services
         // MKCOL（建目录）同样不在 HttpMethod 里。
         private static readonly HttpMethod MkColMethod = new HttpMethod("MKCOL");
 
-        // 控制类请求（PROPFIND / HEAD）的默认超时：100 秒。
+        // 控制类请求（PROPFIND / HEAD / MKCOL / DELETE）的默认超时：100 秒。
         private static readonly TimeSpan ControlRequestTimeout = TimeSpan.FromSeconds(100);
+
+        // 上传/下载流读写的滑动空闲超时：60 秒。
+        private static readonly TimeSpan TransferIdleTimeout = TimeSpan.FromSeconds(60);
+
+        // 读取错误响应体时的保护超时：10 秒。
+        private static readonly TimeSpan ErrorBodyReadTimeout = TimeSpan.FromSeconds(10);
+
+        // 最大受控重定向次数。
+        private const int MaxRedirects = 5;
+
+        // 瞬态错误（429/502/503/504）最大重试次数。
+        private const int MaxTransientRetries = 2;
+
+        // XML 解析最大字符数限制（10 MB）。
+        private const long MaxXmlCharacters = 10 * 1024 * 1024;
 
         // DAV: 命名空间。
         private static readonly XNamespace DavNamespace = XNamespace.Get("DAV:");
@@ -110,7 +128,8 @@ namespace DataManager.Services
             {
                 // 不使用 Credentials/挑战应答：改为每个请求显式带 Authorization 头。
                 PreAuthenticate = false,
-                AllowAutoRedirect = true,
+                // 关闭自动重定向，改为受控重定向（防降级、防认证头泄露、正确处理非 GET 方法）。
+                AllowAutoRedirect = false,
             };
 
             _httpClient = new HttpClient(handler, disposeHandler: true);
@@ -134,44 +153,44 @@ namespace DataManager.Services
         /// <summary>
         /// 连接测试：对基地址发 PROPFIND Depth:0。成功返回 true；失败抛 <see cref="WebDavException"/>。
         /// </summary>
-        public bool TestConnection()
+        public bool TestConnection(CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return TestConnectionAsync(CancellationToken.None).GetAwaiter().GetResult();
+            return TestConnectionAsync(cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// 列出目录下条目（PROPFIND Depth:1）。返回项的 Name 为相对名称（不含路径），已过滤集合自身。
         /// </summary>
-        public List<WebDavEntry> List()
+        public List<WebDavEntry> List(CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return ListAsync(null, CancellationToken.None).GetAwaiter().GetResult();
+            return ListAsync(null, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// 列出指定子目录下的条目（PROPFIND Depth:1）。remoteDirectory 为空表示基地址目录。
         /// 目录不存在（404）时返回空列表，便于界面直接显示“还没有备份”。
         /// </summary>
-        public List<WebDavEntry> List(string remoteDirectory)
+        public List<WebDavEntry> List(string remoteDirectory, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return ListAsync(remoteDirectory, CancellationToken.None).GetAwaiter().GetResult();
+            return ListAsync(remoteDirectory, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// 判断远端文件是否存在。404 返回 false，其他错误抛 <see cref="WebDavException"/>。
         /// </summary>
-        public bool Exists(string remoteName)
+        public bool Exists(string remoteName, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return ExistsAsync(remoteName, CancellationToken.None).GetAwaiter().GetResult();
+            return ExistsAsync(remoteName, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// 判断远端目录是否存在。目录用结尾斜杠表示，避免服务器 301 重定向。
         /// </summary>
-        public bool DirectoryExists(string remoteDirectory)
+        public bool DirectoryExists(string remoteDirectory, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
@@ -180,7 +199,7 @@ namespace DataManager.Services
                 return true;   // 基地址本身就是目录
             }
 
-            return DirectoryExistsAsync(NormalizeRelativePath(remoteDirectory), CancellationToken.None)
+            return DirectoryExistsAsync(NormalizeRelativePath(remoteDirectory), cancellationToken)
                 .GetAwaiter().GetResult();
         }
 
@@ -196,7 +215,7 @@ namespace DataManager.Services
                     // 注意：这里不能用 ResolveUri——它会把结尾斜杠去掉，
                     // 而集合必须带斜杠，否则服务器会回 301。
                     string uri = ResolveCollectionUri(remoteDirectory);
-                    return await ExistsByPropFindAsync(uri, Action, cts).ConfigureAwait(false);
+                    return await CollectionExistsAsync(uri, cts).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -208,17 +227,17 @@ namespace DataManager.Services
         /// <summary>
         /// 取远端文件大小（字节）。不存在返回 -1；服务器未提供长度时也返回 -1。
         /// </summary>
-        public long GetContentLength(string remoteName)
+        public long GetContentLength(string remoteName, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return GetContentLengthAsync(remoteName, CancellationToken.None).GetAwaiter().GetResult();
+            return GetContentLengthAsync(remoteName, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
         /// 上传本地文件（PUT）。progress 报告已发送字节数（可为 null）。
         /// 取消时抛 OperationCanceledException；超时或其他失败抛 <see cref="WebDavException"/>。
         /// </summary>
-        public void Upload(string localFilePath, string remoteName, IProgress<long> progress, CancellationToken cancellationToken)
+        public void Upload(string localFilePath, string remoteName, IProgress<long> progress, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             UploadAsync(localFilePath, remoteName, progress, cancellationToken).GetAwaiter().GetResult();
@@ -229,19 +248,29 @@ namespace DataManager.Services
         /// progress 报告已接收字节数（可为 null）。
         /// 取消时抛 OperationCanceledException；超时或其他失败抛 <see cref="WebDavException"/>。
         /// </summary>
-        public void Download(string remoteName, string localFilePath, IProgress<long> progress, CancellationToken cancellationToken)
+        public void Download(string remoteName, string localFilePath, IProgress<long> progress, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             DownloadAsync(remoteName, localFilePath, progress, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
-        /// 远端文件最后修改时间（UTC）。取不到（不存在或服务器未提供）返回 null。
+        /// 删除远端文件或资源（DELETE）。
+        /// 取消时抛 OperationCanceledException；超时或其他失败抛 <see cref="WebDavException"/>。
         /// </summary>
-        public DateTime? GetLastModified(string remoteName)
+        public void Delete(string remotePath, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
-            return GetLastModifiedAsync(remoteName, CancellationToken.None).GetAwaiter().GetResult();
+            DeleteAsync(remotePath, cancellationToken).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// 远端文件最后修改时间（UTC）。取不到（不存在或服务器未提供）返回 null。
+        /// </summary>
+        public DateTime? GetLastModified(string remoteName, CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+            return GetLastModifiedAsync(remoteName, cancellationToken).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -264,7 +293,7 @@ namespace DataManager.Services
         ///
         /// remoteDirectory 为空表示根目录（无需创建）。已存在的目录会被跳过。
         /// </summary>
-        public void EnsureDirectory(string remoteDirectory, CancellationToken cancellationToken)
+        public void EnsureDirectory(string remoteDirectory, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             EnsureDirectoryAsync(remoteDirectory, cancellationToken).GetAwaiter().GetResult();
@@ -364,7 +393,7 @@ namespace DataManager.Services
 
         /// <summary>
         /// 解析 PROPFIND 的 207 Multi-Status 响应（容错：允许 DAV: 前缀或默认命名空间、允许缺少个别元素）。
-        /// 注意：本方法纯粹解析 XML，不会过滤集合自身；<see cref="List"/> 会做这一步过滤。
+        /// 注意：本方法纯粹解析 XML，不会过滤集合自身；<see cref="List()"/> 会做这一步过滤。
         /// </summary>
         public static List<WebDavEntry> ParsePropFindResponse(string xml)
         {
@@ -460,14 +489,14 @@ namespace DataManager.Services
         }
 
         // ------------------------------------------------------------------
-        // 请求辅助
+        // 请求辅助（受控重定向 + 瞬态退避重试）
         // ------------------------------------------------------------------
 
-        /// <summary>创建请求并带上显式 Basic 认证头。</summary>
-        private HttpRequestMessage CreateRequest(HttpMethod method, string uri)
+        /// <summary>创建请求，并按需带上显式 Basic 认证头。</summary>
+        private HttpRequestMessage CreateRequest(HttpMethod method, string uri, bool includeAuthorization = true)
         {
             var request = new HttpRequestMessage(method, uri);
-            if (_authorization != null)
+            if (includeAuthorization && _authorization != null)
             {
                 request.Headers.TryAddWithoutValidation("Authorization", _authorization);
             }
@@ -484,6 +513,146 @@ namespace DataManager.Services
             return content;
         }
 
+        /// <summary>
+        /// 发送请求并执行受控重定向（最多 5 次、禁止 https 降级到 http、仅同主机或 http→https 升级传递认证头）
+        /// 及轻量指数退避重试（针对 429/502/503/504，最多 2 次）。
+        /// </summary>
+        private async Task<HttpResponseMessage> SendControlledAsync(
+            string initialUri,
+            Func<string, bool, HttpRequestMessage> requestFactory,
+            CancellationToken cancellationToken)
+        {
+            for (int retry = 0; ; retry++)
+            {
+                string currentUriText = initialUri;
+                bool includeAuth = true;
+
+                for (int redirectCount = 0; ; redirectCount++)
+                {
+                    HttpResponseMessage response;
+                    using (var request = requestFactory(currentUriText, includeAuth))
+                    {
+                        response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    int code = (int)response.StatusCode;
+
+                    // 处理受控重定向（301/302/303/307/308）
+                    if (IsRedirectStatusCode(code))
+                    {
+                        Uri location = response.Headers.Location;
+                        if (location == null)
+                        {
+                            // 无 Location 头时无法继续重定向，交由上层处理状态码
+                            return response;
+                        }
+
+                        Uri currentUri = response.RequestMessage?.RequestUri ?? new Uri(currentUriText, UriKind.Absolute);
+                        Uri nextUri = location.IsAbsoluteUri ? location : new Uri(currentUri, location);
+
+                        if (!string.Equals(nextUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                            !string.Equals(nextUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                        {
+                            response.Dispose();
+                            throw new WebDavException("WebDAV 重定向到不支持的协议：" + nextUri.AbsoluteUri);
+                        }
+
+                        if (string.Equals(currentUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(nextUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+                        {
+                            response.Dispose();
+                            throw new WebDavException("WebDAV 安全策略阻止从 HTTPS 降级重定向到明文 HTTP：" + nextUri.AbsoluteUri);
+                        }
+
+                        if (redirectCount >= MaxRedirects)
+                        {
+                            response.Dispose();
+                            throw new WebDavException("WebDAV 请求重定向次数过多（超过 " + MaxRedirects.ToString(CultureInfo.InvariantCulture) + " 次）。");
+                        }
+
+                        // 若重定向指向完全相同的 URI（例如某些服务器对已存在目录发 301 到自身），避免无意义循环
+                        if (string.Equals(currentUri.AbsoluteUri, nextUri.AbsoluteUri, StringComparison.Ordinal))
+                        {
+                            return response;
+                        }
+
+                        // 仅在同主机同端口或同主机 http -> https 升级时安全传递认证头
+                        includeAuth = includeAuth && CanForwardAuthorization(currentUri, nextUri);
+                        currentUriText = nextUri.AbsoluteUri;
+                        response.Dispose();
+                        continue;
+                    }
+
+                    // 处理瞬态错误（429/502/503/504）轻量指数退避重试
+                    if (IsTransientStatusCode(code) && retry < MaxTransientRetries)
+                    {
+                        TimeSpan delay = GetRetryDelay(response, retry);
+                        response.Dispose();
+                        await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                        break;
+                    }
+
+                    return response;
+                }
+            }
+        }
+
+        private static bool IsRedirectStatusCode(int code)
+        {
+            return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+        }
+
+        private static bool IsTransientStatusCode(int code)
+        {
+            return code == 429 || code == 502 || code == 503 || code == 504;
+        }
+
+        private static TimeSpan GetRetryDelay(HttpResponseMessage response, int retryIndex)
+        {
+            RetryConditionHeaderValue retryAfter = response.Headers.RetryAfter;
+            if (retryAfter != null)
+            {
+                if (retryAfter.Delta.HasValue && retryAfter.Delta.Value > TimeSpan.Zero && retryAfter.Delta.Value <= TimeSpan.FromSeconds(10))
+                {
+                    return retryAfter.Delta.Value;
+                }
+
+                if (retryAfter.Date.HasValue)
+                {
+                    TimeSpan delta = retryAfter.Date.Value - DateTimeOffset.UtcNow;
+                    if (delta > TimeSpan.Zero && delta <= TimeSpan.FromSeconds(10))
+                    {
+                        return delta;
+                    }
+                }
+            }
+
+            // 轻量指数退避：第 1 次 500ms，第 2 次 1500ms
+            return retryIndex == 0 ? TimeSpan.FromMilliseconds(500) : TimeSpan.FromMilliseconds(1500);
+        }
+
+        /// <summary>判断是否允许将 Authorization 头传递给重定向目标。</summary>
+        private static bool CanForwardAuthorization(Uri from, Uri to)
+        {
+            if (!string.Equals(from.Host, to.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            bool sameScheme = string.Equals(from.Scheme, to.Scheme, StringComparison.OrdinalIgnoreCase);
+            if (sameScheme)
+            {
+                return from.Port == to.Port;
+            }
+
+            // 允许 http -> https 安全升级（默认端口 80 -> 443）
+            bool isHttpToHttps =
+                string.Equals(from.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(to.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
+
+            return isHttpToHttps && from.IsDefaultPort && to.IsDefaultPort;
+        }
+
         /// <summary>创建与外部令牌联动、带超时的 CancellationTokenSource。</summary>
         private static CancellationTokenSource CreateLinkedTokenSource(CancellationToken externalToken, TimeSpan timeout)
         {
@@ -497,9 +666,9 @@ namespace DataManager.Services
         }
 
         /// <summary>把 HTTP 错误状态包装成中文 WebDavException（含状态码与原因短语）。</summary>
-        private static async Task<WebDavException> CreateHttpErrorAsync(HttpResponseMessage response, string action)
+        private static async Task<WebDavException> CreateHttpErrorAsync(HttpResponseMessage response, string action, CancellationToken cancellationToken)
         {
-            string body = await ReadErrorBodyAsync(response).ConfigureAwait(false);
+            string body = await ReadErrorBodyAsync(response, cancellationToken).ConfigureAwait(false);
             string reason = string.IsNullOrWhiteSpace(response.ReasonPhrase)
                 ? response.StatusCode.ToString()
                 : response.ReasonPhrase;
@@ -562,6 +731,8 @@ namespace DataManager.Services
                     return "服务器上的文件已被其他程序修改。";
                 case 423:
                     return "远端资源已被锁定。";
+                case 429:
+                    return "请求过于频繁，请稍后重试。";
                 case 507:
                     return "服务器存储空间不足。";
                 default:
@@ -575,7 +746,7 @@ namespace DataManager.Services
         }
 
         /// <summary>读取错误响应体的一小段，便于定位问题。</summary>
-        private static async Task<string> ReadErrorBodyAsync(HttpResponseMessage response)
+        private static async Task<string> ReadErrorBodyAsync(HttpResponseMessage response, CancellationToken cancellationToken)
         {
             try
             {
@@ -584,19 +755,22 @@ namespace DataManager.Services
                     return null;
                 }
 
-                string text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                if (string.IsNullOrWhiteSpace(text))
+                using (var bodyCts = CreateLinkedTokenSource(cancellationToken, ErrorBodyReadTimeout))
                 {
-                    return null;
-                }
+                    string text = await response.Content.ReadAsStringAsync(bodyCts.Token).ConfigureAwait(false);
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        return null;
+                    }
 
-                text = text.Replace('\r', ' ').Replace('\n', ' ').Replace('\t', ' ').Trim();
-                if (text.Length > 200)
-                {
-                    text = text.Substring(0, 200) + "…";
-                }
+                    text = text.Replace('\r', ' ').Replace('\n', ' ').Replace('\t', ' ').Trim();
+                    if (text.Length > 200)
+                    {
+                        text = text.Substring(0, 200) + "…";
+                    }
 
-                return text;
+                    return text;
+                }
             }
             catch (Exception)
             {
@@ -629,6 +803,16 @@ namespace DataManager.Services
                 if (cts != null && cts.IsCancellationRequested)
                 {
                     return new WebDavException("WebDAV " + action + "超时：" + DescribeTimeout(timeout), canceled);
+                }
+
+                // 滑动空闲超时触发（外部未取消，但流读写内层 idleCts 触发取消）
+                if (timeout == System.Threading.Timeout.InfiniteTimeSpan)
+                {
+                    return new WebDavException(
+                        "WebDAV " + action + "超时：超过 " +
+                        TransferIdleTimeout.TotalSeconds.ToString("0", CultureInfo.InvariantCulture) +
+                        " 秒无数据传输。",
+                        canceled);
                 }
 
                 return new WebDavException("WebDAV " + action + "被中断：" + canceled.Message, canceled);
@@ -693,23 +877,26 @@ namespace DataManager.Services
             {
                 try
                 {
-                    using (var request = CreateRequest(PropFindMethod, BaseUrl))
-                    {
-                        request.Headers.TryAddWithoutValidation("Depth", "0");
-                        request.Content = CreatePropFindContent();
-
-                        using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        BaseUrl,
+                        (uri, includeAuth) =>
                         {
-                            int code = (int)response.StatusCode;
+                            var request = CreateRequest(PropFindMethod, uri, includeAuth);
+                            request.Headers.TryAddWithoutValidation("Depth", "0");
+                            request.Content = CreatePropFindContent();
+                            return request;
+                        },
+                        cts.Token).ConfigureAwait(false))
+                    {
+                        int code = (int)response.StatusCode;
 
-                            // 正常 WebDAV 服务器返回 207 Multi-Status；个别服务器对 PROPFIND 返回 200。
-                            if (code == 207 || code == 200)
-                            {
-                                return true;
-                            }
-
-                            throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                        // 正常 WebDAV 服务器返回 207 Multi-Status；个别服务器对 PROPFIND 返回 200。
+                        if (code == 207 || code == 200)
+                        {
+                            return true;
                         }
+
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -728,7 +915,7 @@ namespace DataManager.Services
             const string Action = "列出目录";
             TimeSpan timeout = ControlRequestTimeout;
 
-            // 目标 Uri 与“集合自身”的路径键：目录为空时就是基地址本身。
+            // 目标 Uri：目录为空时就是基地址本身。
             string targetUri = string.IsNullOrWhiteSpace(remoteDirectory)
                 ? BaseUrl
                 : ResolveCollectionUri(remoteDirectory);
@@ -737,47 +924,51 @@ namespace DataManager.Services
             {
                 try
                 {
-                    using (var request = CreateRequest(PropFindMethod, targetUri))
-                    {
-                        request.Headers.TryAddWithoutValidation("Depth", "1");
-                        request.Content = CreatePropFindContent();
-
-                        using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        targetUri,
+                        (uri, includeAuth) =>
                         {
-                            int code = (int)response.StatusCode;
+                            var request = CreateRequest(PropFindMethod, uri, includeAuth);
+                            request.Headers.TryAddWithoutValidation("Depth", "1");
+                            request.Content = CreatePropFindContent();
+                            return request;
+                        },
+                        cts.Token).ConfigureAwait(false))
+                    {
+                        int code = (int)response.StatusCode;
 
-                            // 目录还不存在时返回空列表，而不是抛错：
-                            // 界面上“还没有备份”比一条报错更合适。
-                            if (code == 404 || code == 410)
-                            {
-                                return new List<WebDavEntry>();
-                            }
-
-                            if (code != 207 && code != 200)
-                            {
-                                throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
-                            }
-
-                            string xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                            List<RawEntry> raws = ParsePropFindRaw(xml);
-
-                            // Depth:1 的结果里包含基地址对应的集合自身，这里按 href 路径比对后剔除。
-                            string selfKey = GetPathKey(targetUri);
-
-                            var result = new List<WebDavEntry>(raws.Count);
-                            for (int i = 0; i < raws.Count; i++)
-                            {
-                                RawEntry raw = raws[i];
-                                if (selfKey != null && string.Equals(GetPathKey(raw.Href), selfKey, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    continue;
-                                }
-
-                                result.Add(ToEntry(raw));
-                            }
-
-                            return result;
+                        // 目录还不存在时返回空列表，而不是抛错：
+                        // 界面上“还没有备份”比一条报错更合适。
+                        if (code == 404 || code == 410)
+                        {
+                            return new List<WebDavEntry>();
                         }
+
+                        if (code != 207 && code != 200)
+                        {
+                            throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
+                        }
+
+                        string xml = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+                        List<RawEntry> raws = ParsePropFindRaw(xml);
+
+                        // Depth:1 的结果里包含目标集合自身，用最终请求 URI 计算 selfKey 准确剔除。
+                        string effectiveUri = response.RequestMessage?.RequestUri?.AbsoluteUri ?? targetUri;
+                        string selfKey = GetPathKey(effectiveUri);
+
+                        var result = new List<WebDavEntry>(raws.Count);
+                        for (int i = 0; i < raws.Count; i++)
+                        {
+                            RawEntry raw = raws[i];
+                            if (selfKey != null && string.Equals(GetPathKey(raw.Href), selfKey, StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            result.Add(ToEntry(raw));
+                        }
+
+                        return result;
                     }
                 }
                 catch (Exception ex)
@@ -788,7 +979,7 @@ namespace DataManager.Services
         }
 
         // ------------------------------------------------------------------
-        // 存在性 / 大小 / 修改时间
+        // 存在性 / 大小 / 修改时间 / 删除
         // ------------------------------------------------------------------
 
         private async Task<bool> ExistsAsync(string remoteName, CancellationToken externalToken)
@@ -802,8 +993,10 @@ namespace DataManager.Services
                 {
                     string uri = ResolveUri(remoteName);
 
-                    using (var request = CreateRequest(HttpMethod.Head, uri))
-                    using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) => CreateRequest(HttpMethod.Head, u, includeAuth),
+                        cts.Token).ConfigureAwait(false))
                     {
                         int code = (int)response.StatusCode;
                         if (code >= 200 && code < 300)
@@ -822,7 +1015,7 @@ namespace DataManager.Services
                             return await ExistsByPropFindAsync(uri, Action, cts).ConfigureAwait(false);
                         }
 
-                        throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -834,26 +1027,29 @@ namespace DataManager.Services
 
         private async Task<bool> ExistsByPropFindAsync(string uri, string action, CancellationTokenSource cts)
         {
-            using (var request = CreateRequest(PropFindMethod, uri))
-            {
-                request.Headers.TryAddWithoutValidation("Depth", "0");
-                request.Content = CreatePropFindContent();
-
-                using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+            using (var response = await SendControlledAsync(
+                uri,
+                (u, includeAuth) =>
                 {
-                    int code = (int)response.StatusCode;
-                    if (code == 207 || code == 200)
-                    {
-                        return true;
-                    }
-
-                    if (code == 404 || code == 410)
-                    {
-                        return false;
-                    }
-
-                    throw await CreateHttpErrorAsync(response, action).ConfigureAwait(false);
+                    var request = CreateRequest(PropFindMethod, u, includeAuth);
+                    request.Headers.TryAddWithoutValidation("Depth", "0");
+                    request.Content = CreatePropFindContent();
+                    return request;
+                },
+                cts.Token).ConfigureAwait(false))
+            {
+                int code = (int)response.StatusCode;
+                if (code == 207 || code == 200)
+                {
+                    return true;
                 }
+
+                if (code == 404 || code == 410)
+                {
+                    return false;
+                }
+
+                throw await CreateHttpErrorAsync(response, action, cts.Token).ConfigureAwait(false);
             }
         }
 
@@ -868,8 +1064,10 @@ namespace DataManager.Services
                 {
                     string uri = ResolveUri(remoteName);
 
-                    using (var request = CreateRequest(HttpMethod.Head, uri))
-                    using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) => CreateRequest(HttpMethod.Head, u, includeAuth),
+                        cts.Token).ConfigureAwait(false))
                     {
                         int code = (int)response.StatusCode;
                         if (code >= 200 && code < 300)
@@ -894,7 +1092,7 @@ namespace DataManager.Services
                             return await GetContentLengthByPropFindAsync(uri, Action, cts).ConfigureAwait(false);
                         }
 
-                        throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -906,37 +1104,40 @@ namespace DataManager.Services
 
         private async Task<long> GetContentLengthByPropFindAsync(string uri, string action, CancellationTokenSource cts)
         {
-            using (var request = CreateRequest(PropFindMethod, uri))
-            {
-                request.Headers.TryAddWithoutValidation("Depth", "0");
-                request.Content = CreatePropFindContent();
-
-                using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+            using (var response = await SendControlledAsync(
+                uri,
+                (u, includeAuth) =>
                 {
-                    int code = (int)response.StatusCode;
-                    if (code != 207 && code != 200)
+                    var request = CreateRequest(PropFindMethod, u, includeAuth);
+                    request.Headers.TryAddWithoutValidation("Depth", "0");
+                    request.Content = CreatePropFindContent();
+                    return request;
+                },
+                cts.Token).ConfigureAwait(false))
+            {
+                int code = (int)response.StatusCode;
+                if (code != 207 && code != 200)
+                {
+                    if (code == 404 || code == 410)
                     {
-                        if (code == 404 || code == 410)
-                        {
-                            return -1;
-                        }
-
-                        throw await CreateHttpErrorAsync(response, action).ConfigureAwait(false);
+                        return -1;
                     }
 
-                    string xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    List<RawEntry> raws = ParsePropFindRaw(xml);
-
-                    for (int i = 0; i < raws.Count; i++)
-                    {
-                        if (raws[i].HasLength)
-                        {
-                            return raws[i].Length;
-                        }
-                    }
-
-                    return -1;
+                    throw await CreateHttpErrorAsync(response, action, cts.Token).ConfigureAwait(false);
                 }
+
+                string xml = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+                List<RawEntry> raws = ParsePropFindRaw(xml);
+
+                for (int i = 0; i < raws.Count; i++)
+                {
+                    if (raws[i].HasLength)
+                    {
+                        return raws[i].Length;
+                    }
+                }
+
+                return -1;
             }
         }
 
@@ -951,8 +1152,10 @@ namespace DataManager.Services
                 {
                     string uri = ResolveUri(remoteName);
 
-                    using (var request = CreateRequest(HttpMethod.Head, uri))
-                    using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) => CreateRequest(HttpMethod.Head, u, includeAuth),
+                        cts.Token).ConfigureAwait(false))
                     {
                         int code = (int)response.StatusCode;
                         if (code >= 200 && code < 300)
@@ -976,7 +1179,7 @@ namespace DataManager.Services
                             return await GetLastModifiedByPropFindAsync(uri, Action, cts).ConfigureAwait(false);
                         }
 
-                        throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -988,36 +1191,76 @@ namespace DataManager.Services
 
         private async Task<DateTime?> GetLastModifiedByPropFindAsync(string uri, string action, CancellationTokenSource cts)
         {
-            using (var request = CreateRequest(PropFindMethod, uri))
-            {
-                request.Headers.TryAddWithoutValidation("Depth", "0");
-                request.Content = CreatePropFindContent();
-
-                using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+            using (var response = await SendControlledAsync(
+                uri,
+                (u, includeAuth) =>
                 {
-                    int code = (int)response.StatusCode;
-                    if (code != 207 && code != 200)
+                    var request = CreateRequest(PropFindMethod, u, includeAuth);
+                    request.Headers.TryAddWithoutValidation("Depth", "0");
+                    request.Content = CreatePropFindContent();
+                    return request;
+                },
+                cts.Token).ConfigureAwait(false))
+            {
+                int code = (int)response.StatusCode;
+                if (code != 207 && code != 200)
+                {
+                    if (code == 404 || code == 410)
                     {
-                        if (code == 404 || code == 410)
-                        {
-                            return null;
-                        }
-
-                        throw await CreateHttpErrorAsync(response, action).ConfigureAwait(false);
+                        return null;
                     }
 
-                    string xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    List<RawEntry> raws = ParsePropFindRaw(xml);
+                    throw await CreateHttpErrorAsync(response, action, cts.Token).ConfigureAwait(false);
+                }
 
-                    for (int i = 0; i < raws.Count; i++)
+                string xml = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+                List<RawEntry> raws = ParsePropFindRaw(xml);
+
+                for (int i = 0; i < raws.Count; i++)
+                {
+                    if (raws[i].LastModified.HasValue)
                     {
-                        if (raws[i].LastModified.HasValue)
-                        {
-                            return raws[i].LastModified;
-                        }
+                        return raws[i].LastModified;
                     }
+                }
 
-                    return null;
+                return null;
+            }
+        }
+
+        private async Task DeleteAsync(string remotePath, CancellationToken externalToken)
+        {
+            const string Action = "删除远端文件";
+            TimeSpan timeout = ControlRequestTimeout;
+
+            if (string.IsNullOrWhiteSpace(remotePath))
+            {
+                throw new WebDavException("WebDAV 删除失败：远端路径不能为空。");
+            }
+
+            using (var cts = CreateLinkedTokenSource(externalToken, timeout))
+            {
+                try
+                {
+                    string uri = ResolveUri(remotePath);
+
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) => CreateRequest(HttpMethod.Delete, u, includeAuth),
+                        cts.Token).ConfigureAwait(false))
+                    {
+                        int code = (int)response.StatusCode;
+                        if (code == 200 || code == 202 || code == 204)
+                        {
+                            return;
+                        }
+
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    throw MapException(ex, Action, timeout, cts, externalToken);
                 }
             }
         }
@@ -1068,16 +1311,17 @@ namespace DataManager.Services
         /// <summary>
         /// 对单级目录发 MKCOL。
         ///
-        /// 201 = 新建成功。405 是**二义**的：RFC 4918 允许服务器用 405 表示“集合已存在”，
-        /// 但 405 的本义是“不支持该方法”。所以收到 405 时必须回查一次，确认目录真的存在；
-        /// 否则会把“服务器不支持 MKCOL”误判成成功，等到 PUT 时才报 404，反而更难排查。
+        /// 201 = 新建成功。405 是二义的（已存在或不支持 MKCOL），301 可能来自无 Location 或同路径重定向；
+        /// 遇到 405 / 301 时回查 PROPFIND 并校验 IsCollection == true 确认目录确实存在。
         /// </summary>
         private async Task CreateCollectionAsync(string relativePath, string action, CancellationTokenSource cts)
         {
             string uri = ResolveCollectionUri(relativePath);
 
-            using (var request = CreateRequest(MkColMethod, uri))
-            using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+            using (var response = await SendControlledAsync(
+                uri,
+                (u, includeAuth) => CreateRequest(MkColMethod, u, includeAuth),
+                cts.Token).ConfigureAwait(false))
             {
                 int code = (int)response.StatusCode;
 
@@ -1088,8 +1332,8 @@ namespace DataManager.Services
 
                 if (code == 405 || code == 301)
                 {
-                    // 可能是“已存在”，也可能是“不支持 MKCOL”——回查确认。
-                    if (await CollectionExistsAsync(uri, cts).ConfigureAwait(false))
+                    string checkUri = response.RequestMessage?.RequestUri?.AbsoluteUri ?? uri;
+                    if (await CollectionExistsAsync(checkUri, cts).ConfigureAwait(false))
                     {
                         return;
                     }
@@ -1099,37 +1343,47 @@ namespace DataManager.Services
                         "请先在网盘上手动创建该目录，或把【远端目录】留空。");
                 }
 
-                throw await CreateHttpErrorAsync(response, action).ConfigureAwait(false);
+                throw await CreateHttpErrorAsync(response, action, cts.Token).ConfigureAwait(false);
             }
         }
 
-        /// <summary>用 PROPFIND Depth:0 确认目标是否为已存在的集合。</summary>
+        /// <summary>用 PROPFIND Depth:0 确认目标是否为已存在的集合（IsCollection == true）。</summary>
         private async Task<bool> CollectionExistsAsync(string uri, CancellationTokenSource cts)
         {
-            using (var request = CreateRequest(PropFindMethod, uri))
-            {
-                request.Headers.TryAddWithoutValidation("Depth", "0");
-                request.Content = CreatePropFindContent();
-
-                using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+            using (var response = await SendControlledAsync(
+                uri,
+                (u, includeAuth) =>
                 {
-                    int code = (int)response.StatusCode;
-                    if (code == 404 || code == 410)
-                    {
-                        return false;
-                    }
-
-                    if (code != 207 && code != 200)
-                    {
-                        return false;
-                    }
-
-                    string xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    List<RawEntry> raws = ParsePropFindRaw(xml);
-
-                    // 只要能查到条目，就说明这个路径确实存在。
-                    return raws.Count > 0;
+                    var request = CreateRequest(PropFindMethod, u, includeAuth);
+                    request.Headers.TryAddWithoutValidation("Depth", "0");
+                    request.Content = CreatePropFindContent();
+                    return request;
+                },
+                cts.Token).ConfigureAwait(false))
+            {
+                int code = (int)response.StatusCode;
+                if (code == 404 || code == 410)
+                {
+                    return false;
                 }
+
+                if (code != 207 && code != 200)
+                {
+                    return false;
+                }
+
+                string xml = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
+                List<RawEntry> raws = ParsePropFindRaw(xml);
+
+                for (int i = 0; i < raws.Count; i++)
+                {
+                    if (raws[i].IsCollection)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
 
@@ -1141,7 +1395,7 @@ namespace DataManager.Services
         {
             const string Action = UploadAction;
 
-            // 传输不设总时长上限：大文件在慢速链路上耗时很长，取消完全交给调用方的令牌。
+            // 传输不设总时长上限：由调用方取消令牌 + 60 秒滑动空闲超时控制。
             TimeSpan timeout = System.Threading.Timeout.InfiniteTimeSpan;
 
             if (string.IsNullOrEmpty(localFilePath))
@@ -1170,23 +1424,25 @@ namespace DataManager.Services
                 {
                     string uri = ResolveUri(remoteName);
 
-                    using (var request = CreateRequest(HttpMethod.Put, uri))
-                    using (var content = new ProgressFileContent(localFilePath, length, progress, cts.Token))
-                    {
-                        request.Content = content;
-
-                        using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) =>
                         {
-                            int code = (int)response.StatusCode;
+                            var request = CreateRequest(HttpMethod.Put, u, includeAuth);
+                            request.Content = new ProgressFileContent(localFilePath, length, progress, cts.Token);
+                            return request;
+                        },
+                        cts.Token).ConfigureAwait(false))
+                    {
+                        int code = (int)response.StatusCode;
 
-                            // 200/201/204 都视为成功（有的服务器返回 204 No Content）。
-                            if (code == 200 || code == 201 || code == 204)
-                            {
-                                return;
-                            }
-
-                            throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                        // 200/201/204 都视为成功（有的服务器返回 204 No Content）。
+                        if (code == 200 || code == 201 || code == 204)
+                        {
+                            return;
                         }
+
+                        throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -1200,7 +1456,7 @@ namespace DataManager.Services
         {
             const string Action = "下载文件";
 
-            // 传输不设总时长上限，取消完全交给调用方的令牌。
+            // 传输不设总时长上限：由调用方取消令牌 + 60 秒滑动空闲超时控制。
             TimeSpan timeout = System.Threading.Timeout.InfiniteTimeSpan;
 
             if (string.IsNullOrEmpty(localFilePath))
@@ -1237,36 +1493,60 @@ namespace DataManager.Services
                 {
                     string uri = ResolveUri(remoteName);
 
-                    using (var request = CreateRequest(HttpMethod.Get, uri))
-                    using (var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    using (var response = await SendControlledAsync(
+                        uri,
+                        (u, includeAuth) => CreateRequest(HttpMethod.Get, u, includeAuth),
+                        cts.Token).ConfigureAwait(false))
                     {
                         int code = (int)response.StatusCode;
                         if (code < 200 || code >= 300)
                         {
-                            throw await CreateHttpErrorAsync(response, Action).ConfigureAwait(false);
+                            throw await CreateHttpErrorAsync(response, Action, cts.Token).ConfigureAwait(false);
                         }
 
+                        long? expectedLength = response.Content.Headers.ContentLength;
                         long total = 0;
                         long lastReported = 0;
                         byte[] buffer = new byte[CopyBufferSize];
 
-                        using (var source = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
-                        using (var target = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, CopyBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous))
+                        using (var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token))
                         {
-                            int read;
-                            while ((read = await source.ReadAsync(buffer, 0, buffer.Length, cts.Token).ConfigureAwait(false)) > 0)
+                            idleCts.CancelAfter(TransferIdleTimeout);
+                            using (var source = await response.Content.ReadAsStreamAsync(idleCts.Token).ConfigureAwait(false))
+                            using (var target = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, CopyBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous))
                             {
-                                await target.WriteAsync(buffer, 0, read, cts.Token).ConfigureAwait(false);
-                                total += read;
-
-                                if (progress != null && total - lastReported >= ProgressReportInterval)
+                                while (true)
                                 {
-                                    lastReported = total;
-                                    progress.Report(total);
-                                }
-                            }
+                                    idleCts.CancelAfter(TransferIdleTimeout);
+                                    int read = await source.ReadAsync(buffer, 0, buffer.Length, idleCts.Token).ConfigureAwait(false);
+                                    if (read <= 0)
+                                    {
+                                        break;
+                                    }
 
-                            await target.FlushAsync(cts.Token).ConfigureAwait(false);
+                                    idleCts.CancelAfter(TransferIdleTimeout);
+                                    await target.WriteAsync(buffer, 0, read, idleCts.Token).ConfigureAwait(false);
+                                    total += read;
+
+                                    if (progress != null && total - lastReported >= ProgressReportInterval)
+                                    {
+                                        lastReported = total;
+                                        progress.Report(total);
+                                    }
+                                }
+
+                                idleCts.CancelAfter(TransferIdleTimeout);
+                                await target.FlushAsync(idleCts.Token).ConfigureAwait(false);
+                            }
+                        }
+
+                        if (expectedLength.HasValue && expectedLength.Value >= 0 && total != expectedLength.Value)
+                        {
+                            throw new WebDavException(
+                                "WebDAV 下载文件不完整：预期 " +
+                                expectedLength.Value.ToString(CultureInfo.InvariantCulture) +
+                                " 字节，实际接收 " +
+                                total.ToString(CultureInfo.InvariantCulture) + " 字节。");
                         }
 
                         if (progress != null && lastReported != total)
@@ -1274,7 +1554,7 @@ namespace DataManager.Services
                             progress.Report(total);
                         }
 
-                        // 全部字节落盘后才覆盖目标文件：中途失败不会破坏原有文件。
+                        // 全部字节校验并落盘后才覆盖目标文件：中途失败不会破坏原有文件。
                         File.Move(tempPath, targetPath, true);
                         moved = true;
                     }
@@ -1307,7 +1587,7 @@ namespace DataManager.Services
         }
 
         /// <summary>
-        /// 上传用的 HttpContent：打开本地文件按块写入请求流，并上报已发送字节数。
+        /// 上传用的 HttpContent：打开本地文件按块写入请求流，带 60 秒滑动空闲超时并上报已发送字节数。
         /// TryComputeLength 返回真实文件长度，因此会带上 Content-Length，服务器可预分配空间。
         /// </summary>
         private sealed class ProgressFileContent : HttpContent
@@ -1343,20 +1623,27 @@ namespace DataManager.Services
                 return SerializeCoreAsync(stream, cancellationToken);
             }
 
-            /// <summary>把文件内容写入目标流；每次写完一块就累加并（按间隔）上报进度。</summary>
+            /// <summary>把文件内容写入目标流；每次读写重置 60 秒空闲超时并按间隔上报进度。</summary>
             private async Task SerializeCoreAsync(Stream target, CancellationToken cancellationToken)
             {
                 byte[] buffer = new byte[CopyBufferSize];
                 long total = 0;
                 long lastReported = 0;
 
-                // FileShare.ReadWrite：即使别的程序也打开了该文件（例如数据库文件）也能读取。
+                using (var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cancellationToken))
                 using (var source = new FileStream(_localFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, CopyBufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous))
                 {
-                    int read;
-                    while ((read = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
+                    while (true)
                     {
-                        await target.WriteAsync(buffer, 0, read, cancellationToken).ConfigureAwait(false);
+                        idleCts.CancelAfter(TransferIdleTimeout);
+                        int read = await source.ReadAsync(buffer, 0, buffer.Length, idleCts.Token).ConfigureAwait(false);
+                        if (read <= 0)
+                        {
+                            break;
+                        }
+
+                        idleCts.CancelAfter(TransferIdleTimeout);
+                        await target.WriteAsync(buffer, 0, read, idleCts.Token).ConfigureAwait(false);
                         total += read;
 
                         if (_progress != null && (total - lastReported >= ProgressReportInterval || total >= _length))
@@ -1401,7 +1688,7 @@ namespace DataManager.Services
             };
         }
 
-        /// <summary>解析 207 响应，得到原始条目列表。</summary>
+        /// <summary>解析 207 响应，得到原始条目列表（禁用 DTD、限制最大文档大小、仅读取 200 propstat）。</summary>
         private static List<RawEntry> ParsePropFindRaw(string xml)
         {
             var list = new List<RawEntry>();
@@ -1413,9 +1700,20 @@ namespace DataManager.Services
             XDocument document;
             try
             {
-                document = XDocument.Parse(xml, LoadOptions.None);
+                var settings = new XmlReaderSettings
+                {
+                    DtdProcessing = DtdProcessing.Prohibit,
+                    XmlResolver = null,
+                    MaxCharactersInDocument = MaxXmlCharacters,
+                };
+
+                using (var stringReader = new StringReader(xml))
+                using (var xmlReader = XmlReader.Create(stringReader, settings))
+                {
+                    document = XDocument.Load(xmlReader, LoadOptions.None);
+                }
             }
-            catch (System.Xml.XmlException ex)
+            catch (XmlException ex)
             {
                 throw new WebDavException("解析 WebDAV 响应失败：返回内容不是合法的 XML（" + ex.Message + "）。", ex);
             }
@@ -1438,7 +1736,38 @@ namespace DataManager.Services
 
                 raw.Name = ExtractName(raw.Href);
 
-                XElement lengthElement = FindFirstElement(response, "getcontentlength");
+                bool hasPropStat = false;
+                foreach (XElement propstat in FindElements(response, "propstat"))
+                {
+                    hasPropStat = true;
+                    XElement statusElement = FindFirstElement(propstat, "status");
+                    if (statusElement == null ||
+                        statusElement.Value.IndexOf(" 200 ", StringComparison.Ordinal) < 0)
+                    {
+                        // 仅从 <D:status> 包含 " 200 " 的 propstat 块提取属性，忽略 404 等无效块
+                        continue;
+                    }
+
+                    ExtractPropertiesFromContainer(propstat, raw);
+                }
+
+                if (!hasPropStat)
+                {
+                    // 容错：极少数非标准服务器若未包 propstat，退回直接从 response 提取
+                    ExtractPropertiesFromContainer(response, raw);
+                }
+
+                list.Add(raw);
+            }
+
+            return list;
+        }
+
+        private static void ExtractPropertiesFromContainer(XElement container, RawEntry raw)
+        {
+            if (!raw.HasLength)
+            {
+                XElement lengthElement = FindFirstElement(container, "getcontentlength");
                 if (lengthElement != null)
                 {
                     long parsed;
@@ -1448,23 +1777,25 @@ namespace DataManager.Services
                         raw.HasLength = true;
                     }
                 }
+            }
 
-                XElement modifiedElement = FindFirstElement(response, "getlastmodified");
+            if (!raw.LastModified.HasValue)
+            {
+                XElement modifiedElement = FindFirstElement(container, "getlastmodified");
                 if (modifiedElement != null)
                 {
                     raw.LastModified = ParseHttpDate(modifiedElement.Value);
                 }
+            }
 
-                XElement resourceTypeElement = FindFirstElement(response, "resourcetype");
+            if (!raw.IsCollection)
+            {
+                XElement resourceTypeElement = FindFirstElement(container, "resourcetype");
                 if (resourceTypeElement != null && FindFirstElement(resourceTypeElement, "collection") != null)
                 {
                     raw.IsCollection = true;
                 }
-
-                list.Add(raw);
             }
-
-            return list;
         }
 
         /// <summary>

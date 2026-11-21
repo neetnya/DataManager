@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using DataManager.Dialogs;
@@ -36,6 +37,9 @@ namespace DataManager
         /// <summary>窗口内发生过改动，关闭时调用方需要刷新。</summary>
         public bool Changed { get; private set; }
 
+        /// <summary>是否存在可打标签的有效目标（分组列单元格全为空时为 false）。</summary>
+        private bool HasTargets => _toGroup ? _groupValues.Count > 0 : _rowIds.Count > 0;
+
         public TagEditorWindow(AppTable table, AppColumn column, List<RowVm> rows, AppData data)
         {
             InitializeComponent();
@@ -63,20 +67,33 @@ namespace DataManager
                 }
             }
 
+            UpdateTargetControlsState();
             BuildScopeText();
             RebuildTagRows();
 
-            Loaded += (s, e) => TxtNewTag.Focus();
+            Loaded += (s, e) =>
+            {
+                if (TxtNewTag.IsEnabled)
+                {
+                    TxtNewTag.Focus();
+                }
+            };
         }
 
-        private string CurrentValue => _row.Cells[_column.Ordinal].Value ?? string.Empty;
+        private string CurrentValue => _row != null ? (_row.Cells[_column.Ordinal].Value ?? string.Empty) : string.Empty;
+
+        private void UpdateTargetControlsState()
+        {
+            bool canAdd = HasTargets;
+            TxtNewTag.IsEnabled = canAdd;
+            BtnAddTag.IsEnabled = canAdd;
+            TxtAddHint.Text = canAdd ? "回车即可添加" : "空分组值不可打标签";
+        }
 
         /// <summary>当前所有归属对象上都已挂的标签 Id（批量时为全部命中才算）。</summary>
-        private HashSet<long> AppliedTagIds()
+        private HashSet<long> AppliedTagIds(List<Tag> tags, List<TagLink> links)
         {
             var ids = new HashSet<long>();
-            List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
-            List<Tag> tags = _data.Schema.LoadTags(_table.Id);
 
             foreach (Tag tag in tags)
             {
@@ -92,6 +109,11 @@ namespace DataManager
         /// <summary>该标签是否已挂到所有目标对象上。</summary>
         private bool IsAppliedToAllTargets(Tag tag, List<TagLink> links)
         {
+            if (_toGroup ? _groupValues.Count == 0 : _rowIds.Count == 0)
+            {
+                return false;
+            }
+
             if (_toGroup)
             {
                 foreach (string gv in _groupValues)
@@ -138,86 +160,116 @@ namespace DataManager
             return true;
         }
 
-        /// <summary>该标签在整张表里被多少行用到（分组标签算同组所有行）。</summary>
-        private int CountRowsUsing(Tag tag)
+        private static string GroupKey(long columnId, string value)
         {
-            List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
-            List<DataRow> all = _data.Rows.Query(_table, new QuerySpec());
+            return columnId.ToString(CultureInfo.InvariantCulture) + "\u0001" + (value ?? string.Empty);
+        }
 
-            int count = 0;
-            foreach (DataRow r in all)
+        /// <summary>单次全表扫描预统计每个标签被多少行使用（分组标签算同组所有行）。</summary>
+        private Dictionary<long, int> CountRowsUsingAllTags(List<DataRow> allRows, List<TagLink> links)
+        {
+            var rowTagIds = new Dictionary<long, HashSet<long>>();
+            var groupTagIds = new Dictionary<string, HashSet<long>>();
+
+            foreach (TagLink l in links)
             {
-                bool hit = false;
-
-                foreach (TagLink l in links)
+                if (l.Scope == TagScope.Row)
                 {
-                    if (l.TagId != tag.Id)
+                    if (!rowTagIds.TryGetValue(l.RowId, out HashSet<long> set))
                     {
-                        continue;
+                        set = new HashSet<long>();
+                        rowTagIds[l.RowId] = set;
                     }
 
-                    if (l.Scope == TagScope.Row)
-                    {
-                        if (l.RowId == r.RowId)
-                        {
-                            hit = true;
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        // 分组归属：该行对应分组列的值（按分隔符拆分后）包含标签绑定的值
-                        for (int i = 0; i < _table.Columns.Count; i++)
-                        {
-                            AppColumn c = _table.Columns[i];
-                            if (c.Id == l.ColumnId && c.IsGroup &&
-                                GroupValueSplitter.Contains(r.Get(i), l.GroupValue))
-                            {
-                                hit = true;
-                                break;
-                            }
-                        }
-
-                        if (hit)
-                        {
-                            break;
-                        }
-                    }
+                    set.Add(l.TagId);
                 }
-
-                if (hit)
+                else
                 {
-                    count++;
+                    string key = GroupKey(l.ColumnId, l.GroupValue);
+                    if (!groupTagIds.TryGetValue(key, out HashSet<long> set))
+                    {
+                        set = new HashSet<long>();
+                        groupTagIds[key] = set;
+                    }
+
+                    set.Add(l.TagId);
                 }
             }
 
-            return count;
+            var counts = new Dictionary<long, int>();
+            var groupCols = new List<(int Index, long ColumnId)>();
+            for (int i = 0; i < _table.Columns.Count; i++)
+            {
+                AppColumn c = _table.Columns[i];
+                if (c.IsGroup)
+                {
+                    groupCols.Add((i, c.Id));
+                }
+            }
+
+            foreach (DataRow r in allRows)
+            {
+                var hit = new HashSet<long>();
+
+                if (rowTagIds.TryGetValue(r.RowId, out HashSet<long> direct))
+                {
+                    hit.UnionWith(direct);
+                }
+
+                for (int g = 0; g < groupCols.Count; g++)
+                {
+                    (int colIndex, long colId) = groupCols[g];
+                    foreach (string part in GroupValueSplitter.Split(r.Get(colIndex)))
+                    {
+                        if (groupTagIds.TryGetValue(GroupKey(colId, part), out HashSet<long> viaGroup))
+                        {
+                            hit.UnionWith(viaGroup);
+                        }
+                    }
+                }
+
+                foreach (long tagId in hit)
+                {
+                    counts.TryGetValue(tagId, out int n);
+                    counts[tagId] = n + 1;
+                }
+            }
+
+            return counts;
         }
 
         private void BuildScopeText()
         {
             if (_toGroup)
             {
-                string shown = CurrentValue.Length == 0 ? "(空值)" : CurrentValue;
-                if (_groupValues.Count > 1)
+                if (_groupValues.Count == 0)
                 {
-                    TxtScope.Text = "归属分组值（共 " + _groupValues.Count + " 个值，批量）：" +
+                    TxtScope.Text = "当前分组列单元格为空，无法添加分组标签，请先填写分组值。";
+                }
+                else if (_groupValues.Count > 1)
+                {
+                    TxtScope.Text = "归属分组值（共 " + _groupValues.Count.ToString(CultureInfo.InvariantCulture) + " 个值，批量）：" +
                                     "该分组下的所有行共用这些标签";
                 }
                 else
                 {
+                    string shown = CurrentValue.Length == 0 ? "(空值)" : CurrentValue;
                     TxtScope.Text = "归属分组值：" + shown + "（该分组下的所有行共用这些标签）";
                 }
             }
             else
             {
-                if (_rowIds.Count > 1)
+                if (_rowIds.Count == 0)
                 {
-                    TxtScope.Text = "归属整行（已选 " + _rowIds.Count + " 行，批量）";
+                    TxtScope.Text = "未选中有效数据行。";
+                }
+                else if (_rowIds.Count > 1)
+                {
+                    TxtScope.Text = "归属整行（已选 " + _rowIds.Count.ToString(CultureInfo.InvariantCulture) + " 行，批量）";
                 }
                 else
                 {
-                    TxtScope.Text = "归属整行（第 " + _row.DisplayIndex + " 行）";
+                    TxtScope.Text = "归属整行（第 " + _row.DisplayIndex.ToString(CultureInfo.InvariantCulture) + " 行）";
                 }
             }
         }
@@ -226,8 +278,12 @@ namespace DataManager
         {
             TagRows.Children.Clear();
 
-            HashSet<long> applied = AppliedTagIds();
             List<Tag> all = _data.Schema.LoadTags(_table.Id);
+            List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
+            List<DataRow> allRows = _data.Rows.Query(_table, new QuerySpec(), false);
+
+            HashSet<long> applied = AppliedTagIds(all, links);
+            Dictionary<long, int> rowCounts = CountRowsUsingAllTags(allRows, links);
 
             if (all.Count == 0)
             {
@@ -242,13 +298,14 @@ namespace DataManager
 
             foreach (Tag tag in all)
             {
-                TagRows.Children.Add(BuildTagRow(tag, applied.Contains(tag.Id)));
+                rowCounts.TryGetValue(tag.Id, out int count);
+                TagRows.Children.Add(BuildTagRow(tag, applied.Contains(tag.Id), count));
             }
 
-            TxtSummary.Text = "本表共 " + all.Count + " 个标签";
+            TxtSummary.Text = "本表共 " + all.Count.ToString(CultureInfo.InvariantCulture) + " 个标签";
         }
 
-        private UIElement BuildTagRow(Tag tag, bool isApplied)
+        private UIElement BuildTagRow(Tag tag, bool isApplied, int usedRowCount)
         {
             var grid = new Grid { Margin = new Thickness(4, 3, 4, 3) };
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -259,7 +316,7 @@ namespace DataManager
             // 名称 + 使用行数
             var name = new TextBlock
             {
-                Text = tag.Name + "（" + CountRowsUsing(tag) + " 行）",
+                Text = tag.Name + "（" + usedRowCount.ToString(CultureInfo.InvariantCulture) + " 行）",
                 FontSize = 13,
                 VerticalAlignment = VerticalAlignment.Center,
                 TextTrimming = TextTrimming.CharacterEllipsis,
@@ -283,10 +340,17 @@ namespace DataManager
                 Padding = new Thickness(10, 2, 10, 2),
                 MinHeight = 24,
                 Margin = new Thickness(0, 0, 6, 0),
+                IsEnabled = HasTargets,
+                ToolTip = HasTargets ? null : "当前分组列单元格为空，无法添加或移除分组标签",
             };
 
             toggle.Click += (s, e) =>
             {
+                if (!HasTargets)
+                {
+                    return;
+                }
+
                 if (isApplied)
                 {
                     RemoveFromCurrent(tag);
@@ -316,12 +380,10 @@ namespace DataManager
 
             delete.Click += (s, e) =>
             {
-                int rows = CountRowsUsing(tag);
-
                 if (!MessageWindow.Confirm(
                         this,
                         "删除标签「" + tag.Name + "」？\n\n" +
-                        "该标签目前被 " + rows + " 行使用，删除后这些行上的标记会消失。\n" +
+                        "该标签目前被 " + usedRowCount.ToString(CultureInfo.InvariantCulture) + " 行使用，删除后这些行上的标记会消失。\n" +
                         "表格里的数据本身不受影响。",
                         "删除标签",
                         MessageTone.Danger,
@@ -381,6 +443,11 @@ namespace DataManager
         /// <summary>把标签加到所有目标对象上（批量）。</summary>
         private void AddToCurrent(Tag tag)
         {
+            if (!HasTargets)
+            {
+                return;
+            }
+
             try
             {
                 if (_toGroup)
@@ -410,6 +477,11 @@ namespace DataManager
         /// <summary>把标签从所有目标对象上移除（标签本身保留）。</summary>
         private void RemoveFromCurrent(Tag tag)
         {
+            if (!HasTargets)
+            {
+                return;
+            }
+
             try
             {
                 List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
@@ -453,6 +525,11 @@ namespace DataManager
         /// <summary>重新从库里读当前单元格的标签，保持界面与数据一致。</summary>
         private void RefreshCurrentTags()
         {
+            if (_row == null)
+            {
+                return;
+            }
+
             List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
             var tagsById = new Dictionary<long, Tag>();
             foreach (Tag t in _data.Schema.LoadTags(_table.Id))
@@ -499,6 +576,12 @@ namespace DataManager
 
         private void OnAdd(object sender, RoutedEventArgs e)
         {
+            if (!HasTargets)
+            {
+                MessageWindow.Show(this, "当前分组列单元格为空，无法添加分组标签，请先填写分组值。", "标签", MessageTone.Warning);
+                return;
+            }
+
             string name = (TxtNewTag.Text ?? string.Empty).Trim();
             if (name.Length == 0)
             {
@@ -509,8 +592,9 @@ namespace DataManager
             try
             {
                 // 同名标签复用
+                List<Tag> tags = _data.Schema.LoadTags(_table.Id);
                 Tag existing = null;
-                foreach (Tag t in _data.Schema.LoadTags(_table.Id))
+                foreach (Tag t in tags)
                 {
                     if (string.Equals(t.Name, name, StringComparison.Ordinal))
                     {
@@ -522,8 +606,10 @@ namespace DataManager
                 Tag tag = existing ?? _data.Schema.EnsureTag(_table.Id, name);
                 TxtNewTag.Text = string.Empty;
 
+                List<TagLink> links = _data.Schema.LoadTagLinks(_table.Id);
+
                 // 已经在当前归属上就当作“移除”，方便反复切换
-                if (AppliedTagIds().Contains(tag.Id))
+                if (IsAppliedToAllTargets(tag, links))
                 {
                     RemoveFromCurrent(tag);
                 }

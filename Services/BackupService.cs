@@ -3,15 +3,39 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace DataManager.Services
 {
+    /// <summary>
+    /// 主数据库文件已替换，但替换后清理残留 -wal/-shm/-journal 伴随文件失败时抛出的异常。
+    /// 调用方据此可明确区分“替换前中止”与“替换后伴随文件清理失败”，优先回滚备份。
+    /// </summary>
+    public sealed class DatabaseSidecarCleanupException : IOException
+    {
+        public DatabaseSidecarCleanupException(string message, Exception inner)
+            : base(message, inner)
+        {
+        }
+    }
+
     /// <summary>
     /// 本地备份：在软件目录生成带时间戳的 sqlite 备份文件。
     /// 以及 WebDAV 备份/恢复所依赖的文件替换逻辑。
     /// </summary>
     public static class BackupService
     {
+        private static readonly TimeSpan StalePartialAge = TimeSpan.FromHours(1);
+
+        private static readonly HashSet<string> WindowsReservedDeviceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        };
+
+        private static readonly string[] SqliteSidecarSuffixes = new[] { "-wal", "-shm", "-journal" };
+
         /// <summary>
         /// 生成远端备份文件名：<c>前缀_yyyyMMdd_HHmmss.sqlite</c>。
         ///
@@ -20,12 +44,10 @@ namespace DataManager.Services
         /// </summary>
         public static string RemoteBackupFileName(string prefix)
         {
-            string safe = string.IsNullOrWhiteSpace(prefix) ? "DataManager" : prefix.Trim();
-
-            // 去掉文件名里不允许出现在远端路径的字符
-            foreach (char bad in new[] { '/', '\\', ':', '*', '?', '"', '<', '>', '|' })
+            string safe = SafeFileName(prefix);
+            if (string.IsNullOrEmpty(safe))
             {
-                safe = safe.Replace(bad, '_');
+                safe = "DataManager";
             }
 
             return safe + "_" +
@@ -34,22 +56,20 @@ namespace DataManager.Services
         }
 
         /// <summary>
-        /// 从备份文件名里解析出时间（用于列表倒序）；解析不出来时返回 <see cref="DateTime.MinValue"/>。
+        /// 从备份文件名里解析出时间（用于列表倒序）；解析不出来时返回 <paramref name="fallback"/>。
         /// </summary>
         public static DateTime ParseBackupTime(string fileName, DateTime fallback)
         {
             if (!string.IsNullOrEmpty(fileName))
             {
-                // 形如 “DataManager_20261009_233045.sqlite”
+                // 形如 “DataManager_20261009_233045.sqlite” 或 “DataManager_20261009_233045_123.sqlite”
                 string name = Path.GetFileNameWithoutExtension(fileName);
-                int underscore = name.LastIndexOf('_');
-                if (underscore > 0)
+                string[] parts = name.Split('_');
+                for (int i = parts.Length - 1; i >= 1; i--)
                 {
-                    int previous = name.LastIndexOf('_', underscore - 1);
-                    if (previous > 0)
+                    if (parts[i].Length == 6 && parts[i - 1].Length == 8)
                     {
-                        string stamp = name.Substring(previous + 1, underscore - previous - 1) + "_" +
-                                       name.Substring(underscore + 1);
+                        string stamp = parts[i - 1] + "_" + parts[i];
                         DateTime parsed;
                         if (DateTime.TryParseExact(stamp, "yyyyMMdd_HHmmss", CultureInfo.InvariantCulture,
                                 DateTimeStyles.None, out parsed))
@@ -64,7 +84,7 @@ namespace DataManager.Services
         }
 
         /// <summary>
-        /// 只保留文件名，去掉任何目录成分，避免把用户输入当成远端路径使用。
+        /// 只保留文件名，去掉任何目录成分、控制字符与非法字符，并规避 Windows 保留设备名。
         /// </summary>
         public static string SafeFileName(string name)
         {
@@ -80,12 +100,90 @@ namespace DataManager.Services
                 value = value.Substring(slash + 1);
             }
 
-            foreach (char bad in new[] { ':', '*', '?', '"', '<', '>', '|' })
+            var sb = new StringBuilder(value.Length);
+            for (int i = 0; i < value.Length; i++)
             {
-                value = value.Replace(bad, '_');
+                char c = value[i];
+                if (char.IsControl(c))
+                {
+                    continue;
+                }
+
+                if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+                {
+                    sb.Append('_');
+                }
+                else
+                {
+                    sb.Append(c);
+                }
             }
 
-            return value.Trim();
+            string cleaned = sb.ToString().Trim().TrimEnd('.');
+            if (cleaned.Length == 0 || cleaned == "." || cleaned == "..")
+            {
+                return string.Empty;
+            }
+
+            if (IsWindowsReservedDeviceName(cleaned))
+            {
+                cleaned = "_" + cleaned;
+            }
+
+            return cleaned;
+        }
+
+        /// <summary>判断文件名（不含扩展名或首段）是否为 Windows 保留设备名。</summary>
+        private static bool IsWindowsReservedDeviceName(string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return false;
+            }
+
+            int dot = fileName.IndexOf('.');
+            string stem = (dot >= 0 ? fileName.Substring(0, dot) : fileName).Trim();
+            return WindowsReservedDeviceNames.Contains(stem);
+        }
+
+        /// <summary>生成不与现有文件冲突的备份文件路径，冲突时追加毫秒与序号。</summary>
+        private static string AllocateUniqueBackupPath(string directory, string prefix)
+        {
+            string safePrefix = SafeFileName(prefix);
+            if (string.IsNullOrEmpty(safePrefix))
+            {
+                safePrefix = "backup";
+            }
+
+            DateTime now = DateTime.Now;
+            string baseStamp = now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            string candidate = Path.Combine(directory, safePrefix + "_" + baseStamp + ".sqlite");
+            if (!File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            string msStamp = now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+            candidate = Path.Combine(directory, safePrefix + "_" + msStamp + ".sqlite");
+            if (!File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            for (int seq = 1; seq < 10000; seq++)
+            {
+                candidate = Path.Combine(
+                    directory,
+                    safePrefix + "_" + msStamp + "_" + seq.ToString("D2", CultureInfo.InvariantCulture) + ".sqlite");
+                if (!File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return Path.Combine(
+                directory,
+                safePrefix + "_" + msStamp + "_" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".sqlite");
         }
 
         /// <summary>
@@ -93,20 +191,26 @@ namespace DataManager.Services
         /// </summary>
         public static string CreateLocalBackup(Data.SqliteConnection db, string prefix)
         {
+            if (db == null)
+            {
+                throw new ArgumentNullException(nameof(db));
+            }
+
             AppPaths.EnsureCreated();
             CleanStalePartials();
-            string target = Path.Combine(AppPaths.BackupDirectory, AppPaths.BackupFileName(prefix ?? "backup"));
+            string target = AllocateUniqueBackupPath(AppPaths.BackupDirectory, prefix ?? "backup");
             db.BackupTo(target);
             return target;
         }
 
         /// <summary>
-        /// 清理历史失败留下的 “*.sqlite.partial” 残留文件。
-        /// 这些 0 字节文件是早期版本备份失败时产生的，对用户没有意义。
+        /// 清理历史失败留下的 “*.sqlite.partial” 与 “*.replace” 残留文件。
+        /// 仅删除最后修改时间超过 1 小时的残留，避免误删进行中的备份或上传快照。
         /// </summary>
         public static int CleanStalePartials()
         {
             int removed = 0;
+            DateTime cutoffUtc = DateTime.UtcNow - StalePartialAge;
 
             foreach (string directory in new[] { AppPaths.BackupDirectory, AppPaths.RestoreStageDirectory, AppPaths.DataDirectory })
             {
@@ -131,6 +235,13 @@ namespace DataManager.Services
                 {
                     try
                     {
+                        DateTime lastWriteUtc = File.GetLastWriteTimeUtc(file);
+                        if (lastWriteUtc > cutoffUtc)
+                        {
+                            // 仍在活跃窗口内，跳过以防误删正在进行的写入
+                            continue;
+                        }
+
                         File.Delete(file);
                         removed++;
                     }
@@ -159,6 +270,7 @@ namespace DataManager.Services
 
         /// <summary>
         /// 按保留策略清理本地备份。keepCount 为 0 表示保留全部。
+        /// 优先保护近期的 <c>before_restore_*.sqlite</c> 不被常规 <c>startup_</c> 备份冲掉。
         /// 返回被删除的文件数。
         /// </summary>
         public static int PruneLocalBackups(int keepCount)
@@ -169,9 +281,43 @@ namespace DataManager.Services
             }
 
             List<FileInfo> files = ListLocalBackups();
-            int removed = 0;
-            for (int i = keepCount; i < files.Count; i++)
+            if (files.Count <= keepCount)
             {
+                return 0;
+            }
+
+            var keepSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 若 keepCount >= 2，优先为最近的恢复前备份（before_restore_*.sqlite）保留最多 3 个名额，
+            // 同时至少留 1 个名额给最新的常规/手动备份，避免被大量 startup_ 备份冲掉。
+            if (keepCount >= 2)
+            {
+                int maxProtectedRestore = Math.Min(3, keepCount - 1);
+                int protectedCount = 0;
+                for (int i = 0; i < files.Count && protectedCount < maxProtectedRestore; i++)
+                {
+                    if (files[i].Name.StartsWith("before_restore_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        keepSet.Add(files[i].FullName);
+                        protectedCount++;
+                    }
+                }
+            }
+
+            // 剩余名额按时间倒序补齐
+            for (int i = 0; i < files.Count && keepSet.Count < keepCount; i++)
+            {
+                keepSet.Add(files[i].FullName);
+            }
+
+            int removed = 0;
+            for (int i = 0; i < files.Count; i++)
+            {
+                if (keepSet.Contains(files[i].FullName))
+                {
+                    continue;
+                }
+
                 try
                 {
                     files[i].Delete();
@@ -192,7 +338,8 @@ namespace DataManager.Services
         /// <summary>
         /// 用指定的 sqlite 文件替换当前数据库。调用方需保证已关闭数据库连接，
         /// 并在成功后重启软件。
-        /// 先写到同目录的临时文件再 Move 覆盖，避免中断时把主库写成半截。
+        /// 替换前先清理旧的 -wal / -shm / -journal（失败则中止替换保护主库），
+        /// 先写到同目录的临时文件再 Move 覆盖，替换后再次清理伴随文件。
         /// </summary>
         public static void ReplaceDatabase(string sourceSqlitePath)
         {
@@ -207,6 +354,25 @@ namespace DataManager.Services
             string tmp = destination + ".replace";
             bool completed = false;
 
+            // 替换前先尝试清理旧的 -wal / -shm / -journal；若仍被占用则中止替换以保护主库
+            foreach (string suffix in SqliteSidecarSuffixes)
+            {
+                string side = destination + suffix;
+                if (File.Exists(side))
+                {
+                    try
+                    {
+                        File.Delete(side);
+                    }
+                    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                    {
+                        throw new IOException(
+                            "替换前无法清理旧数据库伴随文件（" + Path.GetFileName(side) + "），已中止替换以保护当前数据库：" + ex.Message,
+                            ex);
+                    }
+                }
+            }
+
             try
             {
                 if (File.Exists(tmp))
@@ -218,13 +384,22 @@ namespace DataManager.Services
                 File.Move(tmp, destination, true);
                 completed = true;
 
-                // 主文件换成新库后再清旧的 -wal / -shm，避免把旧日志套到新文件上
-                foreach (string suffix in new[] { "-wal", "-shm", "-journal" })
+                // 主文件换成新库后再清一次伴随文件，避免旧日志残留套到新库上
+                foreach (string suffix in SqliteSidecarSuffixes)
                 {
                     string side = destination + suffix;
                     if (File.Exists(side))
                     {
-                        File.Delete(side);
+                        try
+                        {
+                            File.Delete(side);
+                        }
+                        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                        {
+                            throw new DatabaseSidecarCleanupException(
+                                "主数据库文件已替换，但清理残留伴随文件（" + Path.GetFileName(side) + "）失败：" + ex.Message,
+                                ex);
+                        }
                     }
                 }
             }
@@ -246,19 +421,26 @@ namespace DataManager.Services
             }
         }
 
-        /// <summary>把数据库备份成临时文件，返回路径（用于恢复前的自动备份）。</summary>
-        public static string StageCurrentDatabase()
+        /// <summary>
+        /// 使用 SQLite 在线备份 API 把当前数据库备份成临时一致快照，返回路径（用于恢复前暂存）。
+        /// </summary>
+        public static string StageCurrentDatabase(Data.SqliteConnection db)
         {
+            if (db == null)
+            {
+                throw new ArgumentNullException(nameof(db));
+            }
+
             AppPaths.EnsureCreated();
-            string staged = Path.Combine(AppPaths.RestoreStageDirectory, AppPaths.BackupFileName("restore_stage"));
             Directory.CreateDirectory(AppPaths.RestoreStageDirectory);
-            File.Copy(AppPaths.DatabaseFile, staged, true);
+            string staged = AllocateUniqueBackupPath(AppPaths.RestoreStageDirectory, "restore_stage");
+            db.BackupTo(staged);
             return staged;
         }
 
         /// <summary>
-        /// 校验一个文件是否为可用的 SQLite 数据库。
-        /// 只读文件头并尝试打开，避免把损坏或非 SQLite 的文件恢复进主库。
+        /// 校验一个文件是否为本软件可用的 SQLite 数据库。
+        /// 校验完整 16 字节文件头、以只读方式打开执行完整性检查，并核验核心元数据表存在。
         /// </summary>
         public static bool IsValidSqlite(string path, out string reason)
         {
@@ -279,7 +461,7 @@ namespace DataManager.Services
                     return false;
                 }
 
-                // SQLite 文件头固定为 "SQLite format 3\0"
+                // SQLite 文件头固定为 16 字节："SQLite format 3\0"
                 byte[] header = new byte[16];
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
@@ -291,21 +473,29 @@ namespace DataManager.Services
                     }
                 }
 
-                string magic = System.Text.Encoding.ASCII.GetString(header, 0, 15);
-                if (!string.Equals(magic, "SQLite format 3", StringComparison.Ordinal))
+                string magic = Encoding.ASCII.GetString(header, 0, 15);
+                if (!string.Equals(magic, "SQLite format 3", StringComparison.Ordinal) || header[15] != 0)
                 {
                     reason = "不是 SQLite 数据库文件（文件头不匹配）。";
                     return false;
                 }
 
-                // 再做一次完整性检查，确认能真正打开并读到结构
+                // 以只读方式打开，避免对备份文件产生写入或生成伴随文件
                 using (var probe = new Data.SqliteConnection())
                 {
-                    probe.Open(path);
+                    probe.OpenReadOnly(path);
                     string ok = probe.Scalar("PRAGMA quick_check");
-                    if (!string.IsNullOrEmpty(ok) && !string.Equals(ok, "ok", StringComparison.OrdinalIgnoreCase))
+                    if (!string.Equals(ok, "ok", StringComparison.OrdinalIgnoreCase))
                     {
-                        reason = "数据库完整性检查未通过：" + ok;
+                        reason = "数据库完整性检查未通过：" + (string.IsNullOrEmpty(ok) ? "返回空结果" : ok);
+                        return false;
+                    }
+
+                    long metaCount = probe.ScalarLong(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('meta_table', 'meta_column')");
+                    if (metaCount < 2)
+                    {
+                        reason = "该 SQLite 文件不是本软件的数据库（缺少 meta_table 或 meta_column 表）。";
                         return false;
                     }
                 }
@@ -320,7 +510,8 @@ namespace DataManager.Services
         }
 
         /// <summary>人类可读的文件大小。</summary>
-        public static string FormatSize(long bytes)        {
+        public static string FormatSize(long bytes)
+        {
             if (bytes < 1024)
             {
                 return bytes.ToString(CultureInfo.InvariantCulture) + " B";

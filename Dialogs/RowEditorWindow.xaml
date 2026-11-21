@@ -8,6 +8,7 @@
         MinHeight="320"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <Grid Margin="18">
@@ -26,25 +27,37 @@
             </ScrollViewer>
         </Border>
 
-        <StackPanel Grid.Row="1"
-                    Orientation="Horizontal"
-                    HorizontalAlignment="Right"
-                    Margin="0,14,0,0">
-            <Button Content="取消"
-                    IsCancel="True"
-                    MinWidth="82"
-                    Margin="0,0,8,0"
-                    Click="OnCancel" />
-            <Button x:Name="BtnContinueAdd"
-                    Content="继续添加"
-                    MinWidth="82"
-                    Margin="0,0,8,0"
-                    Click="OnContinueAdd" />
-            <Button Content="保存"
-                    IsDefault="True"
-                    MinWidth="82"
-                    Style="{StaticResource PrimaryButton}"
-                    Click="OnSave" />
-        </StackPanel>
+        <Grid Grid.Row="1" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <TextBlock x:Name="TxtAddStatus"
+                       Grid.Column="0"
+                       Style="{StaticResource HintText}"
+                       VerticalAlignment="Center"
+                       Text="" />
+
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right">
+                <Button Content="取消"
+                        IsCancel="True"
+                        MinWidth="82"
+                        Margin="0,0,8,0"
+                        Click="OnCancel" />
+                <Button x:Name="BtnContinueAdd"
+                        Content="继续添加"
+                        MinWidth="82"
+                        Margin="0,0,8,0"
+                        Click="OnContinueAdd" />
+                <Button Content="保存"
+                        IsDefault="True"
+                        MinWidth="82"
+                        Style="{StaticResource PrimaryButton}"
+                        Click="OnSave" />
+            </StackPanel>
+        </Grid>
     </Grid>
 </Window>

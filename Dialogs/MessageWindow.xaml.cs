@@ -1,5 +1,4 @@
-using System.Collections.Generic;
-using System.Media;
+using System;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -47,9 +46,18 @@ namespace DataManager.Dialogs
     /// </summary>
     public partial class MessageWindow : Window
     {
+        private Button _initialFocusButton;
+
         private MessageWindow()
         {
             InitializeComponent();
+            Loaded += (s, e) =>
+            {
+                if (_initialFocusButton != null)
+                {
+                    _initialFocusButton.Focus();
+                }
+            };
         }
 
         /// <summary>用户点了“确定”或“是”返回 true。</summary>
@@ -63,12 +71,12 @@ namespace DataManager.Dialogs
             switch (tone)
             {
                 case MessageTone.Danger:
-                    TxtIcon.Text = "\uE7BA";     // 叉
+                    TxtIcon.Text = "\uEA39";     // 红色圆叉（ErrorBadge）
                     TxtIcon.Foreground = (Brush)Application.Current.Resources["DangerBrush"];
                     break;
 
                 case MessageTone.Warning:
-                    TxtIcon.Text = "\uE7BA";
+                    TxtIcon.Text = "\uE7BA";     // 警告三角
                     TxtIcon.Foreground = new SolidColorBrush(Color.FromRgb(0xC7, 0x77, 0x00));
                     break;
 
@@ -81,23 +89,24 @@ namespace DataManager.Dialogs
             // 图标用系统符号字体，避免依赖特定中文字体
             TxtIcon.FontFamily = new FontFamily("Segoe MDL2 Assets");
 
+            bool useDangerPrimary = tone == MessageTone.Danger && buttons != MessageButtons.Ok;
             Button primary;
             switch (buttons)
             {
                 case MessageButtons.OkCancel:
-                    primary = MakeButton("确定", true);
+                    primary = MakeButton("确定", true, useDangerPrimary);
                     Buttons.Children.Add(primary);
-                    Buttons.Children.Add(MakeButton("取消", false));
+                    Buttons.Children.Add(MakeButton("取消", false, false));
                     break;
 
                 case MessageButtons.YesNo:
-                    primary = MakeButton("是", true);
+                    primary = MakeButton("是", true, useDangerPrimary);
                     Buttons.Children.Add(primary);
-                    Buttons.Children.Add(MakeButton("否", false));
+                    Buttons.Children.Add(MakeButton("否", false, false));
                     break;
 
                 default:
-                    primary = MakeButton("确定", true);
+                    primary = MakeButton("确定", true, false);
                     Buttons.Children.Add(primary);
                     break;
             }
@@ -116,10 +125,12 @@ namespace DataManager.Dialogs
             {
                 safe.IsDefault = true;
                 primary.IsDefault = false;
+                _initialFocusButton = safe;
             }
             else
             {
                 primary.IsDefault = true;
+                _initialFocusButton = primary;
             }
 
             if (safe != null)
@@ -128,24 +139,35 @@ namespace DataManager.Dialogs
             }
         }
 
-        internal Button MakeButton(string text, bool primary)        {
+        private Button CreateStyledButton(string text, string styleKey, Action onClick)
+        {
             var button = new Button
             {
                 Content = text,
                 MinWidth = 82,
                 Margin = new Thickness(8, 0, 0, 0),
-                Style = primary
-                    ? (Style)Application.Current.Resources["PrimaryButton"]
-                    : (Style)Application.Current.Resources["BaseButton"],
+                Style = (Style)Application.Current.Resources[styleKey],
             };
 
-            button.Click += (s, e) =>
+            if (onClick != null)
+            {
+                button.Click += (s, e) => onClick();
+            }
+
+            return button;
+        }
+
+        internal Button MakeButton(string text, bool primary, bool dangerSolid = false)
+        {
+            string styleKey = primary
+                ? (dangerSolid ? "DangerSolidButton" : "PrimaryButton")
+                : "BaseButton";
+
+            return CreateStyledButton(text, styleKey, () =>
             {
                 Accepted = primary;
                 this.CloseWithResult(primary);
-            };
-
-            return button;
+            });
         }
 
         /// <summary>弹出一个提示（只有一个确定）。</summary>
@@ -156,7 +178,8 @@ namespace DataManager.Dialogs
                 return;
             }
 
-            var window = new MessageWindow { Owner = owner };
+            var window = new MessageWindow();
+            window.ApplyOwner(owner);
             window.Configure(message, title, MessageButtons.Ok, tone);
             window.ShowDialog();
         }
@@ -175,7 +198,8 @@ namespace DataManager.Dialogs
                 return false;
             }
 
-            var window = new MessageWindow { Owner = owner };
+            var window = new MessageWindow();
+            window.ApplyOwner(owner);
             window.Configure(message, title, buttons, tone);
             window.ShowDialog();
             return window.Accepted;
@@ -190,7 +214,8 @@ namespace DataManager.Dialogs
                 return SavePromptResult.Discard;
             }
 
-            var window = new MessageWindow { Owner = owner };
+            var window = new MessageWindow();
+            window.ApplyOwner(owner);
             window.Title = title ?? "未保存的改动";
             window.TxtMessage.Text = message ?? string.Empty;
 
@@ -200,28 +225,27 @@ namespace DataManager.Dialogs
 
             SavePromptResult choice = SavePromptResult.Cancel;
 
-            Button save = window.MakeButton("保存", true);
-            save.Click += (s, e) =>
+            Button save = window.CreateStyledButton("保存", "PrimaryButton", () =>
             {
                 choice = SavePromptResult.Save;
                 window.CloseWithResult(true);
-            };
+            });
+            save.IsDefault = true;
 
-            Button discard = window.MakeButton("不保存", false);
-            discard.Click += (s, e) =>
+            Button discard = window.CreateStyledButton("不保存", "BaseButton", () =>
             {
                 choice = SavePromptResult.Discard;
                 window.CloseWithResult(false);
-            };
+            });
 
-            Button cancel = window.MakeButton("取消", false);
-            cancel.IsCancel = true;
-            cancel.Click += (s, e) =>
+            Button cancel = window.CreateStyledButton("取消", "BaseButton", () =>
             {
                 choice = SavePromptResult.Cancel;
                 window.CloseWithResult(false);
-            };
+            });
+            cancel.IsCancel = true;
 
+            window._initialFocusButton = save;
             window.Buttons.Children.Add(save);
             window.Buttons.Children.Add(discard);
             window.Buttons.Children.Add(cancel);

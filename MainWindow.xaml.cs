@@ -1,10 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -18,17 +22,47 @@ namespace DataManager
 {
     public partial class MainWindow : Window
     {
-        private readonly ObservableCollection<RowVm> _rowSource = new ObservableCollection<RowVm>();
+        /// <summary>支持批量替换的可观测集合，单次刷新仅触发一次 Reset 通知。</summary>
+        private sealed class BatchObservableCollection<T> : ObservableCollection<T>
+        {
+            public void ReplaceAll(IEnumerable<T> items)
+            {
+                CheckReentrancy();
+                Items.Clear();
+                if (items != null)
+                {
+                    foreach (T item in items)
+                    {
+                        Items.Add(item);
+                    }
+                }
+
+                OnPropertyChanged(new PropertyChangedEventArgs("Count"));
+                OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+                OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+            }
+        }
+
+        private sealed class ColumnHeaderControls
+        {
+            public AppColumn Column;
+            public Control InputControl;
+            public ToggleButton EmptyToggle;
+        }
+
+        private readonly BatchObservableCollection<RowVm> _rowSource = new BatchObservableCollection<RowVm>();
+        private readonly Dictionary<long, ColumnHeaderControls> _headerControls = new Dictionary<long, ColumnHeaderControls>();
 
         private AppTable _table;
         private QuerySpec _spec = new QuerySpec();
         private Dictionary<long, Tag> _tagsById = new Dictionary<long, Tag>();
-        private List<string[]> _clipboardRows = new List<string[]>();
 
         private bool _suppressEditCommit;
         private bool _suppressWidthSave;
+        private bool _suppressHeaderFilterEvents;
         private bool _widthDirty;
         private System.Windows.Threading.DispatcherTimer _widthSaveTimer;
+        private System.Windows.Threading.DispatcherTimer _debounceTimer;
         private CellVm _editingCell;
         private string _editingOriginal;
         private int _rightClickColumnIndex = -1;
@@ -39,7 +73,7 @@ namespace DataManager
         /// </summary>
         private readonly List<long> _displayOrder = new List<long>();
 
-        /// <summary>撤销历史：一次单元格修改（含粘贴的每个单元格）记一条，最多保留 10 步。</summary>
+        /// <summary>撤销历史：一次单元格修改/批量粘贴/删除行记一条，最多保留 10 步。</summary>
         private readonly List<UndoEntry> _undoStack = new List<UndoEntry>();
         private const int MaxUndoSteps = 10;
 
@@ -49,9 +83,11 @@ namespace DataManager
 
             Grid.ItemsSource = _rowSource;
 
-            // 记录普通状态下的尺寸，供取消最大化后恢复
-            Width = Math.Max(MinWidth, App.Settings.WindowWidth);
-            Height = Math.Max(MinHeight, App.Settings.WindowHeight);
+            // 记录普通状态下的尺寸，供取消最大化后恢复，并与当前工作区尺寸限幅
+            double maxW = Math.Max(MinWidth, SystemParameters.WorkArea.Width);
+            double maxH = Math.Max(MinHeight, SystemParameters.WorkArea.Height);
+            Width = Math.Min(maxW, Math.Max(MinWidth, App.Settings.WindowWidth));
+            Height = Math.Min(maxH, Math.Max(MinHeight, App.Settings.WindowHeight));
 
             // 打开即最大化
             WindowState = WindowState.Maximized;
@@ -111,7 +147,12 @@ namespace DataManager
             else
             {
                 _table = null;
-                _rowSource.Clear();
+                _rowSource.ReplaceAll(null);
+                _headerControls.Clear();
+                _undoStack.Clear();
+                Grid.Columns.Clear();
+                TagBarItems.Items.Clear();
+                TagBar.Visibility = Visibility.Collapsed;
                 UpdateToolbarState();
                 TxtFooter.Text = "还没有数据表，请点击左上角齿轮【设置】创建。";
             }
@@ -125,6 +166,7 @@ namespace DataManager
                 return;
             }
 
+            StopTimers();
             // 切表前把上一张表调整过的列宽落盘
             FlushColumnWidthsIfNeeded();
 
@@ -137,11 +179,17 @@ namespace DataManager
 
             _table = table;
             _spec = new QuerySpec();
+            _rightClickColumnIndex = -1;
+            _undoStack.Clear();
 
             BuildColumns();
-            ReloadRows(true);
-            RebuildTagBar();
-            UpdateToolbarState();
+            RefreshView(true);
+        }
+
+        private void StopTimers()
+        {
+            _debounceTimer?.Stop();
+            _widthSaveTimer?.Stop();
         }
 
         // =================================================================
@@ -152,6 +200,7 @@ namespace DataManager
         {
             _suppressWidthSave = true;
             Grid.Columns.Clear();
+            _headerControls.Clear();
 
             // 行号由行头（RowHeader）显示，这里只放数据列
             foreach (AppColumn c in _table.Columns)
@@ -171,8 +220,8 @@ namespace DataManager
         private void HookColumnResizeEvents()
         {
             Grid.AddHandler(
-                System.Windows.Controls.Primitives.Thumb.DragCompletedEvent,
-                new System.Windows.Controls.Primitives.DragCompletedEventHandler(OnColumnGripperDragCompleted),
+                Thumb.DragCompletedEvent,
+                new DragCompletedEventHandler(OnColumnGripperDragCompleted),
                 true);
         }
 
@@ -188,7 +237,7 @@ namespace DataManager
             var col = new DataGridTemplateColumn
             {
                 Width = width,
-                MinWidth = 60,
+                MinWidth = 76,
                 CellTemplate = BuildCellTemplate(column),
                 CellEditingTemplate = BuildCellEditingTemplate(column),
                 Header = BuildHeader(column),
@@ -200,20 +249,20 @@ namespace DataManager
         }
 
         /// <summary>用户拖动列分隔线后，把整张表所有列的宽度比例一起落盘。</summary>
-        private void OnColumnGripperDragCompleted(object sender, System.Windows.Controls.Primitives.DragCompletedEventArgs e)
+        private void OnColumnGripperDragCompleted(object sender, DragCompletedEventArgs e)
         {
             if (_suppressWidthSave || _table == null)
             {
                 return;
             }
 
-            if (!(e.OriginalSource is System.Windows.Controls.Primitives.Thumb thumb))
+            if (!(e.OriginalSource is Thumb thumb))
             {
                 return;
             }
 
             // 找到这个 Thumb 属于哪个列头，确认是列宽拖动而非其他 Thumb
-            var header = FindAncestor<System.Windows.Controls.Primitives.DataGridColumnHeader>(thumb);
+            var header = FindAncestor<DataGridColumnHeader>(thumb);
             if (header == null || header.Column == null)
             {
                 return;
@@ -340,19 +389,25 @@ namespace DataManager
             _widthSaveTimer.Start();
         }
 
-        /// <summary>列头：只有一个搜索控件（分组列为下拉）。列没有名字，所以不显示列名与配置文字。</summary>
+        /// <summary>列头：搜索控件（分组列为下拉）+ 右侧紧凑“空”筛选切换按钮。</summary>
         private object BuildHeader(AppColumn column)
         {
             var panel = new Grid { Margin = new Thickness(4, 0, 4, 0) };
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            _spec.ColumnFilters.TryGetValue(column.Id, out string existing);
-            existing = existing ?? string.Empty;
+            bool isEmptyActive = _spec != null && _spec.EmptyColumns.Contains(column.Id);
 
-            FrameworkElement input;
+            string existing = string.Empty;
+            if (!isEmptyActive && _spec != null && _spec.ColumnFilters.TryGetValue(column.Id, out string savedFilter))
+            {
+                existing = savedFilter ?? string.Empty;
+            }
+
+            Control input;
             if (column.IsGroup)
             {
                 // 分组列：查询用下拉列表，候选值为该列已有值（去重），也可直接输入。
-                // 不提供“(全部)”项——清空输入框就等于全部，加一项是重复的。
                 var combo = new ComboBox
                 {
                     Tag = column.Id,
@@ -371,9 +426,9 @@ namespace DataManager
 
                 combo.SelectionChanged += OnGroupFilterSelected;
                 combo.LostFocus += OnGroupFilterCommitted;
+                combo.PreviewKeyDown += OnGroupFilterPreviewKeyDown;
 
-                // 直接清空文本（例如全选删除、按 Esc 后清空）也要立刻生效，
-                // 不能只等失焦——否则筛选条件还留着，用户会以为界面坏了。
+                // 直接清空文本（例如全选删除、按 Esc 后清空）也要立刻生效
                 combo.AddHandler(
                     TextBox.TextChangedEvent,
                     new TextChangedEventHandler(OnGroupFilterTextChanged));
@@ -397,14 +452,142 @@ namespace DataManager
                 input = box;
             }
 
+            var emptyBtn = new ToggleButton
+            {
+                Content = "空",
+                Tag = column.Id,
+                Style = (Style)Application.Current.Resources["EmptyFilterToggle"],
+                Margin = new Thickness(3, 0, 0, 0),
+                IsChecked = isEmptyActive,
+                ToolTip = isEmptyActive
+                    ? "已启用：仅显示本列为空的行（再次点击取消）"
+                    : "筛选本列为空的行",
+            };
+            emptyBtn.Click += OnEmptyFilterToggleClick;
+
+            if (isEmptyActive)
+            {
+                input.IsEnabled = false;
+                input.Opacity = 0.55;
+            }
+
+            System.Windows.Controls.Grid.SetColumn(input, 0);
+            System.Windows.Controls.Grid.SetColumn(emptyBtn, 1);
             panel.Children.Add(input);
+            panel.Children.Add(emptyBtn);
+
+            _headerControls[column.Id] = new ColumnHeaderControls
+            {
+                Column = column,
+                InputControl = input,
+                EmptyToggle = emptyBtn,
+            };
+
             return panel;
+        }
+
+        /// <summary>点击列头“空”按钮：切换筛选本列为空的行。</summary>
+        private void OnEmptyFilterToggleClick(object sender, RoutedEventArgs e)
+        {
+            if (_table == null || !(sender is ToggleButton toggle) || !(toggle.Tag is long columnId))
+            {
+                return;
+            }
+
+            bool enabling = !_spec.EmptyColumns.Contains(columnId);
+            if (enabling)
+            {
+                _spec.EmptyColumns.Add(columnId);
+                _spec.ColumnFilters.Remove(columnId);
+            }
+            else
+            {
+                _spec.EmptyColumns.Remove(columnId);
+            }
+
+            if (_headerControls.TryGetValue(columnId, out ColumnHeaderControls controls))
+            {
+                if (enabling)
+                {
+                    _suppressHeaderFilterEvents = true;
+                    if (controls.InputControl is TextBox box)
+                    {
+                        box.Text = string.Empty;
+                    }
+                    else if (controls.InputControl is ComboBox combo)
+                    {
+                        combo.SelectedIndex = -1;
+                        combo.Text = string.Empty;
+                    }
+
+                    _suppressHeaderFilterEvents = false;
+                    controls.InputControl.IsEnabled = false;
+                    controls.InputControl.Opacity = 0.55;
+                    controls.EmptyToggle.IsChecked = true;
+                    controls.EmptyToggle.ToolTip = "已启用：仅显示本列为空的行（再次点击取消）";
+                }
+                else
+                {
+                    controls.InputControl.IsEnabled = true;
+                    controls.InputControl.Opacity = 1.0;
+                    controls.EmptyToggle.IsChecked = false;
+                    controls.EmptyToggle.ToolTip = "筛选本列为空的行";
+                }
+            }
+
+            _debounceTimer?.Stop();
+            RefreshView();
+        }
+
+        /// <summary>增量刷新指定分组列的列头下拉候选值，保留当前输入文本。</summary>
+        private void RefreshGroupHeaderCandidates(AppColumn column)
+        {
+            if (_table == null || column == null || !column.IsGroup)
+            {
+                return;
+            }
+
+            if (!_headerControls.TryGetValue(column.Id, out ColumnHeaderControls controls) ||
+                !(controls.InputControl is ComboBox combo))
+            {
+                return;
+            }
+
+            List<string> fresh = Data.Rows.DistinctValues(_table, column);
+
+            _suppressHeaderFilterEvents = true;
+            string currentText = combo.Text;
+            combo.Items.Clear();
+            foreach (string v in fresh)
+            {
+                combo.Items.Add(v);
+            }
+
+            combo.Text = currentText;
+            _suppressHeaderFilterEvents = false;
+        }
+
+        /// <summary>刷新当前表所有分组列的列头下拉候选值。</summary>
+        private void RefreshAllGroupHeaderCandidates()
+        {
+            if (_table == null)
+            {
+                return;
+            }
+
+            foreach (AppColumn c in _table.Columns)
+            {
+                if (c.IsGroup)
+                {
+                    RefreshGroupHeaderCandidates(c);
+                }
+            }
         }
 
         /// <summary>分组列下拉选择：选中的值即筛选条件。</summary>
         private void OnGroupFilterSelected(object sender, SelectionChangedEventArgs e)
         {
-            if (!(sender is ComboBox combo) || !(combo.Tag is long columnId))
+            if (_suppressHeaderFilterEvents || !(sender is ComboBox combo) || !(combo.Tag is long columnId))
             {
                 return;
             }
@@ -415,10 +598,22 @@ namespace DataManager
             }
         }
 
-        /// <summary>分组列手工输入后按回车或失焦生效；清空即取消该列筛选。</summary>
+        /// <summary>分组列手工输入后按回车立即提交筛选。</summary>
+        private void OnGroupFilterPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter || !(sender is ComboBox combo) || !(combo.Tag is long columnId))
+            {
+                return;
+            }
+
+            SetColumnFilter(columnId, (combo.Text ?? string.Empty).Trim());
+            e.Handled = true;
+        }
+
+        /// <summary>分组列手工输入后失焦生效；清空即取消该列筛选。</summary>
         private void OnGroupFilterCommitted(object sender, RoutedEventArgs e)
         {
-            if (!(sender is ComboBox combo) || !(combo.Tag is long columnId))
+            if (_suppressHeaderFilterEvents || !(sender is ComboBox combo) || !(combo.Tag is long columnId))
             {
                 return;
             }
@@ -427,12 +622,12 @@ namespace DataManager
         }
 
         /// <summary>
-        /// 分组列输入框的文本变化。只在“清空”时立即生效：
-        /// 逐字输入过程中不该反复查库（那是防抖负责的）。
+        /// 分组列输入框的文本变化。只在“清空”时立即生效并重置 SelectedIndex：
+        /// 逐字输入过程中不反复查库。
         /// </summary>
         private void OnGroupFilterTextChanged(object sender, TextChangedEventArgs e)
         {
-            if (!(sender is ComboBox combo) || !(combo.Tag is long columnId))
+            if (_suppressHeaderFilterEvents || !(sender is ComboBox combo) || !(combo.Tag is long columnId))
             {
                 return;
             }
@@ -440,6 +635,13 @@ namespace DataManager
             if (!string.IsNullOrEmpty(combo.Text))
             {
                 return;
+            }
+
+            if (combo.SelectedIndex != -1)
+            {
+                _suppressHeaderFilterEvents = true;
+                combo.SelectedIndex = -1;
+                _suppressHeaderFilterEvents = false;
             }
 
             // 清空了：立刻取消该列筛选
@@ -456,13 +658,20 @@ namespace DataManager
                 return;
             }
 
-            if (string.IsNullOrEmpty(text))
+            string normalized = text ?? string.Empty;
+            _spec.ColumnFilters.TryGetValue(columnId, out string previous);
+            if (string.Equals(previous ?? string.Empty, normalized, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(normalized))
             {
                 _spec.ColumnFilters.Remove(columnId);
             }
             else
             {
-                _spec.ColumnFilters[columnId] = text;
+                _spec.ColumnFilters[columnId] = normalized;
             }
 
             DebounceReload();
@@ -546,16 +755,23 @@ namespace DataManager
         // 载入数据
         // =================================================================
 
+        /// <summary>统一刷新行数据、标签栏计数与工具栏状态。</summary>
+        private void RefreshView(bool resort = false)
+        {
+            ReloadRows(resort);
+            RebuildTagBar();
+            UpdateToolbarState();
+        }
+
         /// <summary>
         /// 刷新行视图。resort 为 true 时按固定排序重排（只在软件打开/切换数据表时使用）；
         /// 其余刷新沿用当前显示顺序，避免编辑、增删行时位置乱跳。
         /// </summary>
         private void ReloadRows(bool resort = false)
         {
-            _rowSource.Clear();
-
             if (_table == null)
             {
+                _rowSource.ReplaceAll(null);
                 _displayOrder.Clear();
                 return;
             }
@@ -609,6 +825,7 @@ namespace DataManager
                     }
                 }
             }
+
             var links = Data.Schema.LoadTagLinks(_table.Id);
 
             // 归属行的标签
@@ -646,6 +863,7 @@ namespace DataManager
                 }
             }
 
+            var built = new List<RowVm>(rows.Count);
             int index = 1;
             foreach (DataRow r in rows)
             {
@@ -697,8 +915,10 @@ namespace DataManager
                     vm.RefreshRowTags(rt);
                 }
 
-                _rowSource.Add(vm);
+                built.Add(vm);
             }
+
+            _rowSource.ReplaceAll(built);
 
             UpdateFooter();
             UpdateEmptyHint();
@@ -709,7 +929,7 @@ namespace DataManager
             return columnId.ToString(CultureInfo.InvariantCulture) + "\u0001" + (value ?? string.Empty);
         }
 
-        private void UpdateFooter()
+        private void UpdateFooter(string extraNotice = null)
         {
             if (_table == null)
             {
@@ -721,6 +941,11 @@ namespace DataManager
             if (_spec != null && _spec.HasAnyFilter)
             {
                 text += "（已筛选）";
+            }
+
+            if (!string.IsNullOrEmpty(extraNotice))
+            {
+                text += "　·　" + extraNotice;
             }
 
             TxtFooter.Text = text;
@@ -752,26 +977,13 @@ namespace DataManager
 
         private void OnColumnSearchChanged(object sender, TextChangedEventArgs e)
         {
-            if (_table == null || !(sender is TextBox box) || !(box.Tag is long columnId))
+            if (_suppressHeaderFilterEvents || _table == null || !(sender is TextBox box) || !(box.Tag is long columnId))
             {
                 return;
             }
 
-            string text = box.Text ?? string.Empty;
-            if (string.IsNullOrEmpty(text))
-            {
-                _spec.ColumnFilters.Remove(columnId);
-            }
-            else
-            {
-                _spec.ColumnFilters[columnId] = text;
-            }
-
-            // 输入过程中防抖，避免每敲一个字都查一次库
-            DebounceReload();
+            SetColumnFilter(columnId, box.Text ?? string.Empty);
         }
-
-        private System.Windows.Threading.DispatcherTimer _debounceTimer;
 
         /// <summary>延迟 250ms 再刷新，用户连续输入时只查一次。</summary>
         private void DebounceReload()
@@ -786,8 +998,7 @@ namespace DataManager
                 _debounceTimer.Tick += (s, args) =>
                 {
                     _debounceTimer.Stop();
-                    ReloadRows();
-                    UpdateToolbarState();
+                    RefreshView();
                 };
             }
 
@@ -797,11 +1008,7 @@ namespace DataManager
 
         private void OnClearFilter(object sender, RoutedEventArgs e)
         {
-            _spec = new QuerySpec();
-            BuildColumns();
-            ReloadRows();
-            RebuildTagBar();
-            UpdateToolbarState();
+            ClearAllFilters();
         }
 
         // =================================================================
@@ -810,7 +1017,7 @@ namespace DataManager
 
         private void OnGridBeginningEdit(object sender, DataGridBeginningEditEventArgs e)
         {
-            if (_table == null || !(e.Row.Item is RowVm row))
+            if (_table == null || !(e.Row.Item is RowVm row) || e.Column == null)
             {
                 return;
             }
@@ -840,9 +1047,25 @@ namespace DataManager
                 return;
             }
 
+            if (e.EditAction == DataGridEditAction.Cancel)
+            {
+                _suppressEditCommit = true;
+                _editingCell.Value = _editingOriginal ?? string.Empty;
+                _suppressEditCommit = false;
+                _editingCell = null;
+                return;
+            }
+
+            if (e.Column == null)
+            {
+                _editingCell = null;
+                return;
+            }
+
             int index = e.Column.DisplayIndex;
             if (index < 0 || index >= _table.Columns.Count)
             {
+                _editingCell = null;
                 return;
             }
 
@@ -881,11 +1104,19 @@ namespace DataManager
                 return;
             }
 
-            PushUndo(row.RowId, column.Ordinal, oldValue, newValue);
+            // 将 Trim() 后的值回写到单元格视图模型，保持界面与数据库一致
+            if (!string.Equals(_editingCell.Value, newValue, StringComparison.Ordinal))
+            {
+                _suppressEditCommit = true;
+                _editingCell.Value = newValue;
+                _suppressEditCommit = false;
+            }
+
+            PushUndo(row.RowId, column.Id, oldValue, newValue);
 
             if (column.IsGroup)
             {
-                // 分组值变了：刷新该列的候选值与标签归属。
+                // 分组值变了：刷新该列的候选值、列头下拉与标签归属。
                 // 用 BeginInvoke 延后，避免在 DataGrid 结束编辑的过程中重建行集合。
                 List<string> fresh = Data.Rows.DistinctValues(_table, column);
                 foreach (RowVm r in _rowSource)
@@ -893,11 +1124,9 @@ namespace DataManager
                     r.Cells[index].GroupCandidates = fresh;
                 }
 
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    ReloadRows();
-                    RebuildTagBar();
-                }), System.Windows.Threading.DispatcherPriority.Background);
+                RefreshGroupHeaderCandidates(column);
+
+                Dispatcher.BeginInvoke(new Action(() => RefreshView()), System.Windows.Threading.DispatcherPriority.Background);
             }
 
             _editingCell = null;
@@ -927,7 +1156,7 @@ namespace DataManager
 
             // 双击落在列头（筛选框）上时，交给搜索框本身处理，不要抢占
             DependencyObject source = e.OriginalSource as DependencyObject;
-            if (source != null && FindAncestor<System.Windows.Controls.Primitives.DataGridColumnHeader>(source) != null)
+            if (source != null && FindAncestor<DataGridColumnHeader>(source) != null)
             {
                 return;
             }
@@ -1049,8 +1278,14 @@ namespace DataManager
             }
 
             DataGridCellInfo info = Grid.SelectedCells[0];
+            if (info.Column == null || !(info.Item is RowVm row))
+            {
+                TxtCellInfo.Text = string.Empty;
+                return;
+            }
+
             int index = info.Column.DisplayIndex;
-            if (!(info.Item is RowVm row) || index < 0 || index >= _table.Columns.Count)
+            if (index < 0 || index >= _table.Columns.Count)
             {
                 TxtCellInfo.Text = string.Empty;
                 return;
@@ -1071,19 +1306,20 @@ namespace DataManager
         }
 
         // =================================================================
-        // 剪贴板：Ctrl+C / Ctrl+V
+        // 快捷键与剪贴板：Ctrl+C / Ctrl+V / Ctrl+Z / Ctrl+F / Ctrl+N / Ctrl+E / F2 / Ctrl+Shift+C
         // =================================================================
 
         /// <summary>
-        /// 窗口级 Ctrl+F 快捷查询：只要软件在前台且当前表可用快捷查询就触发，
-        /// 不再要求焦点落在表格内。用 PreviewKeyDown 在隧道路由阶段拦截，
-        /// 早于表格和各输入控件收到按键。
+        /// 窗口级快捷键：Ctrl+F 快捷查询、Ctrl+Z 撤销、Ctrl+N 新建行、Ctrl+Shift+C 清除筛选、Ctrl+E 编辑整行。
+        /// 用 PreviewKeyDown 在隧道路由阶段拦截，早于表格和各输入控件收到按键。
         /// </summary>
         private void OnWindowPreviewKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Key == Key.F && e.KeyboardDevice.Modifiers == ModifierKeys.Control)
+            ModifierKeys mods = e.KeyboardDevice.Modifiers;
+
+            if (e.Key == Key.F && mods == ModifierKeys.Control)
             {
-                // 正在编辑单元格时，把 Ctrl+F 让给编辑控件（例如文本框里的查找），不抢占
+                // 正在编辑单元格时，把 Ctrl+F 让给编辑控件，不抢占
                 if (IsCellEditing())
                 {
                     return;
@@ -1098,17 +1334,65 @@ namespace DataManager
                 return;
             }
 
-            if (e.Key == Key.Z && e.KeyboardDevice.Modifiers == ModifierKeys.Control)
+            if (e.Key == Key.Z && mods == ModifierKeys.Control)
             {
                 // 焦点在某个文本框（单元格编辑框、列头搜索框等）里时，
                 // 把 Ctrl+Z 让给文本框自身的撤销，不抢占。
-                if (Keyboard.FocusedElement is System.Windows.Controls.Primitives.TextBoxBase)
+                if (Keyboard.FocusedElement is TextBoxBase)
                 {
                     return;
                 }
 
                 if (Undo())
                 {
+                    e.Handled = true;
+                }
+
+                return;
+            }
+
+            if (e.Key == Key.N && mods == ModifierKeys.Control)
+            {
+                if (IsCellEditing() || IsHeaderInputFocused())
+                {
+                    return;
+                }
+
+                if (_table != null && _table.Columns.Count > 0)
+                {
+                    OnAddRow(this, new RoutedEventArgs());
+                    e.Handled = true;
+                }
+
+                return;
+            }
+
+            if (e.Key == Key.C && mods == (ModifierKeys.Control | ModifierKeys.Shift))
+            {
+                if (IsCellEditing())
+                {
+                    return;
+                }
+
+                if (_spec != null && _spec.HasAnyFilter)
+                {
+                    ClearAllFilters();
+                    e.Handled = true;
+                }
+
+                return;
+            }
+
+            if (e.Key == Key.E && mods == ModifierKeys.Control)
+            {
+                if (IsCellEditing() || IsHeaderInputFocused())
+                {
+                    return;
+                }
+
+                if (_table != null && CollectSelectedRows().Count > 0)
+                {
+                    OnEditRow(this, new RoutedEventArgs());
                     e.Handled = true;
                 }
             }
@@ -1143,6 +1427,16 @@ namespace DataManager
                 }
             }
 
+            if (e.Key == Key.F2 && e.KeyboardDevice.Modifiers == ModifierKeys.None && !editing)
+            {
+                if (_table != null && CollectSelectedRows().Count > 0)
+                {
+                    OnEditRow(this, new RoutedEventArgs());
+                    e.Handled = true;
+                    return;
+                }
+            }
+
             if (e.Key == Key.Delete && !editing)
             {
                 OnDeleteRows(this, new RoutedEventArgs());
@@ -1158,9 +1452,8 @@ namespace DataManager
         }
 
         /// <summary>
-        /// 焦点是否落在列头上的搜索框或分组下拉里。
-        /// 这些控件在 DataGrid 的可视树内，事件会先隧传到 DataGrid，
-        /// 必须在处理前把它们排除掉。
+        /// 焦点是否落在列头上的搜索框、分组下拉或筛选按钮里。
+        /// 仅在可视树位于 DataGridColumnHeader 内时返回 true；若先遇到 DataGridCell/DataGridRow 则返回 false。
         /// </summary>
         private bool IsHeaderInputFocused()
         {
@@ -1170,13 +1463,6 @@ namespace DataManager
                 return false;
             }
 
-            // 搜索框 / 分组下拉在列头里
-            if (focused is TextBox || focused is ComboBox)
-            {
-                return true;
-            }
-
-            // 兼容模板内部的子元素（例如可编辑 ComboBox 的 TextBox 部件）
             DependencyObject node = focused;
             while (node != null)
             {
@@ -1185,10 +1471,11 @@ namespace DataManager
                     return false;
                 }
 
-                if (node is System.Windows.Controls.Primitives.DataGridColumnHeader)
+                if (node is DataGridColumnHeader)
                 {
                     return true;
                 }
+
                 node = node is Visual || node is System.Windows.Media.Media3D.Visual3D
                     ? VisualTreeHelper.GetParent(node)
                     : LogicalTreeHelper.GetParent(node);
@@ -1240,6 +1527,22 @@ namespace DataManager
             Grid.CancelEdit(DataGridEditingUnit.Row);
         }
 
+        /// <summary>按 TSV/CSV 引号规则对包含制表符、换行或双引号的字段加双引号转义。</summary>
+        private static string EscapeTsvField(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            if (value.IndexOfAny(new[] { '\t', '\r', '\n', '"' }) >= 0)
+            {
+                return "\"" + value.Replace("\"", "\"\"") + "\"";
+            }
+
+            return value;
+        }
+
         private void CopySelection()
         {
             if (_table == null || Grid.SelectedCells.Count == 0)
@@ -1247,10 +1550,13 @@ namespace DataManager
                 return;
             }
 
-            var byRow = new SortedDictionary<int, SortedDictionary<int, string>>();
+            var byRow = new SortedDictionary<int, Dictionary<int, string>>();
+            int minCol = int.MaxValue;
+            int maxCol = int.MinValue;
+
             foreach (DataGridCellInfo info in Grid.SelectedCells)
             {
-                if (!(info.Item is RowVm row))
+                if (info.Column == null || !(info.Item is RowVm row))
                 {
                     continue;
                 }
@@ -1261,24 +1567,41 @@ namespace DataManager
                     continue;
                 }
 
-                if (!byRow.TryGetValue(row.DisplayIndex, out SortedDictionary<int, string> line))
+                if (col < minCol)
                 {
-                    line = new SortedDictionary<int, string>();
+                    minCol = col;
+                }
+
+                if (col > maxCol)
+                {
+                    maxCol = col;
+                }
+
+                if (!byRow.TryGetValue(row.DisplayIndex, out Dictionary<int, string> line))
+                {
+                    line = new Dictionary<int, string>();
                     byRow[row.DisplayIndex] = line;
                 }
 
                 line[col] = row.Cells[col].Value ?? string.Empty;
             }
 
-            if (byRow.Count == 0)
+            if (byRow.Count == 0 || minCol > maxCol)
             {
                 return;
             }
 
-            var lines = new List<string>();
-            foreach (KeyValuePair<int, SortedDictionary<int, string>> kv in byRow)
+            var lines = new List<string>(byRow.Count);
+            foreach (KeyValuePair<int, Dictionary<int, string>> kv in byRow)
             {
-                lines.Add(string.Join("\t", kv.Value.Values));
+                var fields = new List<string>(maxCol - minCol + 1);
+                for (int c = minCol; c <= maxCol; c++)
+                {
+                    kv.Value.TryGetValue(c, out string raw);
+                    fields.Add(EscapeTsvField(raw ?? string.Empty));
+                }
+
+                lines.Add(string.Join("\t", fields));
             }
 
             string text = string.Join("\r\n", lines);
@@ -1295,7 +1618,7 @@ namespace DataManager
         private static List<string[]> ParseDelimited(string text, char delimiter)
         {
             var rows = new List<string[]>();
-            var field = new System.Text.StringBuilder();
+            var field = new StringBuilder();
             var current = new List<string>();
             bool inQuotes = false;
 
@@ -1370,8 +1693,8 @@ namespace DataManager
         }
 
         /// <summary>
-        /// 粘贴：从锚点单元格开始按块填涂，空值会清空目标单元格；
-        /// 唯一约束冲突时整体回滚并提示。
+        /// 粘贴：取选区最小 (rowIndex, colDisplayIndex) 作为锚点按块填涂，空值会清空目标单元格；
+        /// 唯一约束冲突时整体回滚并在事务外提示；成功后以单条批量撤销记录入栈。
         /// </summary>
         private void PasteAtSelection()
         {
@@ -1405,26 +1728,37 @@ namespace DataManager
                 return;
             }
 
-            DataGridCellInfo anchor = Grid.SelectedCells[0];
-            if (!(anchor.Item is RowVm anchorRow))
+            // 取选区最小 (rowIndex, colDisplayIndex) 作为粘贴锚点
+            int startRowIndex = int.MaxValue;
+            int startCol = int.MaxValue;
+            foreach (DataGridCellInfo info in Grid.SelectedCells)
+            {
+                if (info.Column == null || !(info.Item is RowVm candidateRow))
+                {
+                    continue;
+                }
+
+                int rowIdx = _rowSource.IndexOf(candidateRow);
+                int colIdx = info.Column.DisplayIndex;
+                if (rowIdx < 0 || colIdx < 0)
+                {
+                    continue;
+                }
+
+                if (rowIdx < startRowIndex || (rowIdx == startRowIndex && colIdx < startCol))
+                {
+                    startRowIndex = rowIdx;
+                    startCol = colIdx;
+                }
+            }
+
+            if (startRowIndex == int.MaxValue || startCol == int.MaxValue)
             {
                 return;
             }
 
-            int startCol = anchor.Column.DisplayIndex;
-            if (startCol < 0)
-            {
-                startCol = 0;
-            }
-
-            int startRowIndex = _rowSource.IndexOf(anchorRow);
-            if (startRowIndex < 0)
-            {
-                return;
-            }
-
-            // 先做整体校验
-            var pending = new List<(RowVm Row, int Col, string Value)>();
+            // 先收集变更并对粘贴值执行 Trim()
+            var pending = new List<(RowVm Row, int Col, string OldValue, string NewValue)>();
             for (int r = 0; r < block.Count; r++)
             {
                 int targetRow = startRowIndex + r;
@@ -1442,14 +1776,14 @@ namespace DataManager
                         break;
                     }
 
-                    string value = block[r][c] ?? string.Empty;
+                    string value = (block[r][c] ?? string.Empty).Trim();
                     string old = row.Cells[targetCol].Value ?? string.Empty;
                     if (string.Equals(old, value, StringComparison.Ordinal))
                     {
                         continue;
                     }
 
-                    pending.Add((row, targetCol, value));
+                    pending.Add((row, targetCol, old, value));
                 }
             }
 
@@ -1458,11 +1792,12 @@ namespace DataManager
                 return;
             }
 
-            // 校验 + 写入放在同一个事务里，避免校验与写入之间被插入数据
+            // 校验 + 写入放在同一个事务里，弹窗一律移到事务外避免长时间持锁
+            string pasteError = null;
             using (SqliteConnection.Tx tx = Data.Connection.Transaction())
             {
                 var seen = new Dictionary<string, string>();
-                foreach ((RowVm row, int col, string value) in pending)
+                foreach ((RowVm row, int col, string oldValue, string value) in pending)
                 {
                     AppColumn column = _table.Columns[col];
                     if (column.IsUnique && value.Length > 0)
@@ -1470,42 +1805,76 @@ namespace DataManager
                         string error = Data.Rows.ValidateUnique(_table, column, value, row.RowId);
                         if (error != null)
                         {
-                            MessageWindow.Show(this, error, "无法粘贴", Dialogs.MessageTone.Warning);
-                            return;
+                            pasteError = error;
+                            break;
                         }
 
                         string key = col.ToString(CultureInfo.InvariantCulture) + "\u0001" + value.ToLowerInvariant();
                         if (seen.TryGetValue(key, out string owner) &&
                             owner != row.RowId.ToString(CultureInfo.InvariantCulture))
                         {
-                            MessageWindow.Show(this, column.DisplayName + " 在本次粘贴内容中存在重复的值：" + value,
-                                "无法粘贴",
-                                Dialogs.MessageTone.Warning);
-                            return;
+                            pasteError = column.DisplayName + " 在本次粘贴内容中存在重复的值：" + value;
+                            break;
                         }
 
                         seen[key] = row.RowId.ToString(CultureInfo.InvariantCulture);
                     }
                 }
 
-                foreach ((RowVm row, int col, string value) in pending)
+                if (pasteError == null)
                 {
-                    string old = row.Cells[col].Value ?? string.Empty;
-                    string error = Data.Rows.UpdateCell(_table, row.RowId, _table.Columns[col], value);
-                    if (error != null)
+                    foreach ((RowVm row, int col, string oldValue, string value) in pending)
                     {
-                        MessageWindow.Show(this, error, "无法粘贴", Dialogs.MessageTone.Warning);
-                        return;
+                        string error = Data.Rows.UpdateCell(_table, row.RowId, _table.Columns[col], value);
+                        if (error != null)
+                        {
+                            pasteError = error;
+                            break;
+                        }
                     }
-
-                    row.Cells[col].Value = value;
-                    PushUndo(row.RowId, col, old, value);
                 }
 
-                tx.Complete();
+                if (pasteError == null)
+                {
+                    tx.Complete();
+                }
             }
 
-            ReloadRows();
+            if (pasteError != null)
+            {
+                MessageWindow.Show(this, pasteError, "无法粘贴", Dialogs.MessageTone.Warning);
+                return;
+            }
+
+            // 事务提交成功后再统一更新 UI 并以单条批量撤销记录入栈
+            var undoItems = new List<CellUndoItem>(pending.Count);
+            var touchedGroupCols = new HashSet<int>();
+            foreach ((RowVm row, int col, string oldValue, string value) in pending)
+            {
+                row.Cells[col].Value = value;
+                AppColumn column = _table.Columns[col];
+                undoItems.Add(new CellUndoItem
+                {
+                    RowId = row.RowId,
+                    ColumnId = column.Id,
+                    OldValue = oldValue,
+                    NewValue = value,
+                });
+
+                if (column.IsGroup)
+                {
+                    touchedGroupCols.Add(col);
+                }
+            }
+
+            PushUndoCellsBatch(undoItems);
+
+            foreach (int col in touchedGroupCols)
+            {
+                RefreshGroupHeaderCandidates(_table.Columns[col]);
+            }
+
+            RefreshView();
         }
 
         // =================================================================
@@ -1514,14 +1883,8 @@ namespace DataManager
 
         private void OnAddRow(object sender, RoutedEventArgs e)
         {
-            if (_table == null)
+            if (_table == null || _table.Columns.Count == 0)
             {
-                return;
-            }
-
-            if (_table.Columns.Count == 0)
-            {
-
                 return;
             }
 
@@ -1530,9 +1893,42 @@ namespace DataManager
                 Owner = this,
             };
 
-            if (dialog.ShowDialog() == true)
+            if (dialog.ShowDialog() == true || dialog.Changed)
             {
-                ReloadRows();
+                RefreshAllGroupHeaderCandidates();
+                RefreshView();
+            }
+        }
+
+        private void OnEditRow(object sender, RoutedEventArgs e)
+        {
+            if (_table == null || _table.Columns.Count == 0)
+            {
+                return;
+            }
+
+            List<RowVm> selected = CollectSelectedRows();
+            if (selected.Count == 0)
+            {
+                return;
+            }
+
+            RowVm target = selected[0];
+            DataRow existing = Data.Rows.GetRow(_table, target.RowId);
+            if (existing == null)
+            {
+                return;
+            }
+
+            var dialog = new RowEditorWindow(_table, existing, Data)
+            {
+                Owner = this,
+            };
+
+            if (dialog.ShowDialog() == true || dialog.Changed)
+            {
+                RefreshAllGroupHeaderCandidates();
+                RefreshView();
             }
         }
 
@@ -1562,7 +1958,6 @@ namespace DataManager
 
             if (rowIds.Count == 0)
             {
-
                 return;
             }
 
@@ -1599,7 +1994,10 @@ namespace DataManager
             PushUndoDeleteRows(deletedValues, deletedRowTags);
 
             Data.Rows.DeleteRows(_table, rowIds);
-            ReloadRows();
+            RefreshAllGroupHeaderCandidates();
+            RefreshView();
+
+            UpdateFooter("已删除 " + rowIds.Count.ToString(CultureInfo.InvariantCulture) + " 行，按 Ctrl+Z 可撤销");
         }
 
         // =================================================================
@@ -1694,8 +2092,6 @@ namespace DataManager
                 }
             }
 
-            var panel = new WrapPanel { Orientation = Orientation.Horizontal };
-
             foreach (Tag tag in allTags)
             {
                 rowCount.TryGetValue(tag.Id, out int count);
@@ -1713,14 +2109,15 @@ namespace DataManager
                 if (string.Equals(_spec.TagFilter, tag.Name, StringComparison.Ordinal))
                 {
                     button.FontWeight = FontWeights.SemiBold;
+                    button.Background = (Brush)Application.Current.Resources["SelectionBrush"];
+                    button.BorderBrush = (Brush)Application.Current.Resources["AccentBrush"];
                 }
 
                 button.Click += OnTagFilterClick;
                 button.MouseRightButtonUp += OnTagManageClick;
-                panel.Children.Add(button);
+                TagBarItems.Items.Add(button);
             }
 
-            TagBarItems.Items.Add(panel);
             TagBar.Visibility = Visibility.Visible;
         }
 
@@ -1736,9 +2133,7 @@ namespace DataManager
                 ? null
                 : tag.Name;
 
-            ReloadRows();
-            RebuildTagBar();
-            UpdateToolbarState();
+            RefreshView();
         }
 
         /// <summary>右键标签：重命名 / 删除。</summary>
@@ -1782,11 +2177,10 @@ namespace DataManager
                     _spec.TagFilter = input;
                 }
 
-                ReloadRows();
-                RebuildTagBar();
+                RefreshView();
             };
 
-            // 移除本表内该标签的所有使用（标签本身保留）
+            // 移除本表内该标签的所有使用（标签本身保留，无引用时自动清理）
             var unlink = new MenuItem { Header = "移除标签（清除本表所有使用）" };
             unlink.Click += (s, args) =>
             {
@@ -1805,8 +2199,7 @@ namespace DataManager
                     _spec.TagFilter = null;
                 }
 
-                ReloadRows();
-                RebuildTagBar();
+                RefreshView();
             };
 
             var delete = new MenuItem { Header = "删除标签" };
@@ -1833,8 +2226,7 @@ namespace DataManager
                     _spec.TagFilter = null;
                 }
 
-                ReloadRows();
-                RebuildTagBar();
+                RefreshView();
             };
 
             menu.Items.Add(rename);
@@ -1852,7 +2244,7 @@ namespace DataManager
             }
 
             List<TagLink> links = Data.Schema.LoadTagLinks(_table.Id);
-            List<DataRow> all = Data.Rows.Query(_table, new QuerySpec());
+            List<DataRow> all = Data.Rows.Query(_table, new QuerySpec(), false);
             int count = 0;
 
             foreach (DataRow r in all)
@@ -1902,11 +2294,11 @@ namespace DataManager
             return count;
         }
 
-        /// <summary>右键点单元格时先选中它，保证右键菜单作用在正确的单元格上。</summary>
+        /// <summary>右键点单元格时先选中它，右键点空白处时重置列索引。</summary>
         private void OnGridRightButtonDown(object sender, MouseButtonEventArgs e)
         {
             DependencyObject source = e.OriginalSource as DependencyObject;
-            DataGridCell cell = FindAncestor<DataGridCell>(source);
+            DataGridCell cell = source != null ? FindAncestor<DataGridCell>(source) : null;
 
             if (cell != null)
             {
@@ -1919,6 +2311,38 @@ namespace DataManager
                     cell.IsSelected = true;
                 }
             }
+            else
+            {
+                _rightClickColumnIndex = -1;
+            }
+        }
+
+        /// <summary>统一解析当前操作的目标列索引。</summary>
+        private int ResolveTargetColumnIndex(bool preferRightClick)
+        {
+            if (_table == null || _table.Columns.Count == 0)
+            {
+                return -1;
+            }
+
+            if (preferRightClick && _rightClickColumnIndex >= 0 && _rightClickColumnIndex < _table.Columns.Count)
+            {
+                return _rightClickColumnIndex;
+            }
+
+            foreach (DataGridCellInfo info in Grid.SelectedCells)
+            {
+                if (info.Column != null)
+                {
+                    int idx = info.Column.DisplayIndex;
+                    if (idx >= 0 && idx < _table.Columns.Count)
+                    {
+                        return idx;
+                    }
+                }
+            }
+
+            return 0;
         }
 
         /// <summary>
@@ -1930,21 +2354,24 @@ namespace DataManager
             MenuRemoveTag.Items.Clear();
             MenuRemoveTag.Visibility = Visibility.Collapsed;
 
-            if (_table == null || Grid.SelectedCells.Count == 0)
+            List<RowVm> selectedRows = CollectSelectedRows();
+            bool hasRow = _table != null && selectedRows.Count > 0;
+            MenuEditRow.IsEnabled = hasRow && _table.Columns.Count > 0;
+
+            if (!hasRow)
             {
                 MenuAddTag.IsEnabled = false;
                 return;
             }
 
-            DataGridCellInfo info = Grid.SelectedCells[0];
-            int index = info.Column.DisplayIndex;
-
-            if (!(info.Item is RowVm row) || index < 0 || index >= _table.Columns.Count)
+            int index = ResolveTargetColumnIndex(true);
+            if (index < 0 || index >= _table.Columns.Count)
             {
                 MenuAddTag.IsEnabled = false;
                 return;
             }
 
+            RowVm row = selectedRows[0];
             MenuAddTag.IsEnabled = true;
 
             AppColumn column = _table.Columns[index];
@@ -2010,7 +2437,7 @@ namespace DataManager
             return rows;
         }
 
-        /// <summary>把某个标签从所有选中行的对应归属对象上移除（标签本身保留，批量）。</summary>
+        /// <summary>把某个标签从所有选中行的对应归属对象上移除（标签本身保留，无引用时自动清理）。</summary>
         private void RemoveTagFromCell(AppColumn column, Tag tag)
         {
             List<RowVm> rows = CollectSelectedRows();
@@ -2067,8 +2494,31 @@ namespace DataManager
             }
 
             Data.Schema.PurgeOrphanTags(_table.Id);
-            ReloadRows();
-            RebuildTagBar();
+            SyncTagFilterAfterTagMutation(null);
+            RefreshView();
+        }
+
+        /// <summary>标签被重命名或删除后，同步更新或清空当前正在筛选的 _spec.TagFilter。</summary>
+        private void SyncTagFilterAfterTagMutation(long? trackedTagId)
+        {
+            if (_table == null || string.IsNullOrEmpty(_spec.TagFilter))
+            {
+                return;
+            }
+
+            List<Tag> latest = Data.Schema.LoadTags(_table.Id);
+            if (trackedTagId.HasValue)
+            {
+                Tag foundById = latest.FirstOrDefault(t => t.Id == trackedTagId.Value);
+                _spec.TagFilter = foundById != null ? foundById.Name : null;
+                return;
+            }
+
+            bool exists = latest.Any(t => string.Equals(t.Name, _spec.TagFilter, StringComparison.Ordinal));
+            if (!exists)
+            {
+                _spec.TagFilter = null;
+            }
         }
 
         /// <summary>在可视树里向上找指定类型的祖先。</summary>
@@ -2103,30 +2553,30 @@ namespace DataManager
 
             // 收集所有选中的行（去重）：多选时批量打标签
             List<RowVm> rows = CollectSelectedRows();
-
             if (rows.Count == 0)
             {
                 return;
             }
 
-            // 确定作用列：右键菜单用右键点中的列，否则用第一个选中单元格所在列
-            int index;
-            if (sender == MenuAddTag && _rightClickColumnIndex >= 0)
-            {
-                index = _rightClickColumnIndex;
-            }
-            else if (Grid.SelectedCells.Count > 0)
-            {
-                index = Grid.SelectedCells[0].Column.DisplayIndex;
-            }
-            else
-            {
-                index = 0;
-            }
-
+            // 确定作用列：右键菜单用右键点中的列，否则用第一个有效选中单元格所在列
+            int index = ResolveTargetColumnIndex(sender == MenuAddTag);
             if (index < 0 || index >= _table.Columns.Count)
             {
                 return;
+            }
+
+            // 记录当前筛选标签的 Id，若弹窗中对其改名或删除则同步更新筛选条件
+            long? activeFilterTagId = null;
+            if (!string.IsNullOrEmpty(_spec.TagFilter))
+            {
+                foreach (Tag t in _tagsById.Values)
+                {
+                    if (string.Equals(t.Name, _spec.TagFilter, StringComparison.Ordinal))
+                    {
+                        activeFilterTagId = t.Id;
+                        break;
+                    }
+                }
             }
 
             AppColumn column = _table.Columns[index];
@@ -2139,8 +2589,8 @@ namespace DataManager
 
             if (dialog.Changed)
             {
-                ReloadRows();
-                RebuildTagBar();
+                SyncTagFilterAfterTagMutation(activeFilterTagId);
+                RefreshView();
             }
         }
 
@@ -2195,25 +2645,28 @@ namespace DataManager
                 case QuickQueryOutcome.Fuzzy:
                     _spec.QuickFilterColumnId = result.FilterColumn.Id;
                     _spec.QuickFilterText = result.FilterText;
-                    ReloadRows();
-                    UpdateToolbarState();
+                    RefreshView();
                     break;
 
                 default:
-                    MessageWindow.Show(this, "没有查询到结果。\n\n查询内容：" + (string.IsNullOrEmpty(text) ? "(剪贴板为空)" : text),
+                {
+                    string shown = string.IsNullOrEmpty(text)
+                        ? "(剪贴板为空)"
+                        : (text.Length > 200 ? text.Substring(0, 200) + "…" : text);
+                    MessageWindow.Show(this, "没有查询到结果。\n\n查询内容：" + shown,
                         "快捷查询",
                         Dialogs.MessageTone.Info);
                     break;
+                }
             }
         }
 
         private void ClearAllFilters()
         {
+            _debounceTimer?.Stop();
             _spec = new QuerySpec();
             BuildColumns();
-            ReloadRows();
-            RebuildTagBar();
-            UpdateToolbarState();
+            RefreshView();
         }
 
         /// <summary>跳转并选中指定行。</summary>
@@ -2234,12 +2687,7 @@ namespace DataManager
                 }
             }
 
-            if (target == null)
-            {
-                return;
-            }
-
-            if (Grid.Columns.Count == 0)
+            if (target == null || Grid.Columns.Count == 0)
             {
                 return;
             }
@@ -2252,6 +2700,7 @@ namespace DataManager
             Grid.SelectedCells.Add(Grid.CurrentCell);
             UpdateCellInfo();
         }
+
         // =================================================================
         // 设置
         // =================================================================
@@ -2273,6 +2722,7 @@ namespace DataManager
 
             if (window.SettingsChanged)
             {
+                _undoStack.Clear();
                 Data.ReloadTables();
                 RefreshTableList();
 
@@ -2288,21 +2738,20 @@ namespace DataManager
                         _table = refreshed;
                         _spec = new QuerySpec();
                         BuildColumns();
-                        ReloadRows();
-                        RebuildTagBar();
-                        UpdateToolbarState();
+                        RefreshView(true);
                     }
                 }
                 else
                 {
                     SelectFirstTable();
                 }
-
             }
         }
 
-        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        protected override void OnClosing(CancelEventArgs e)
         {
+            StopTimers();
+
             try
             {
                 // 最大化状态下 Width/Height 是屏幕尺寸，存下来没意义；
@@ -2329,30 +2778,44 @@ namespace DataManager
         }
 
         // =================================================================
-        // 撤销（Ctrl+Z）：单元格值修改
+        // 撤销（Ctrl+Z）：单元格值修改 / 批量粘贴 / 删除行
         // =================================================================
 
         /// <summary>撤销条目类型。</summary>
         private enum UndoKind
         {
-            /// <summary>单元格值修改。</summary>
+            /// <summary>单个单元格值修改。</summary>
             Cell,
+
+            /// <summary>批量单元格值修改（粘贴）。</summary>
+            CellsBatch,
 
             /// <summary>删除行。</summary>
             DeleteRows,
+        }
+
+        private sealed class CellUndoItem
+        {
+            public long RowId;
+            public long ColumnId;
+            public string OldValue;
+            public string NewValue;
         }
 
         /// <summary>一条可撤销操作。</summary>
         private sealed class UndoEntry
         {
             public UndoKind Kind;
-
-            // —— 单元格修改（Cell）——
             public long TableId;
+
+            // —— 单个单元格修改（Cell）——
             public long RowId;
-            public int ColumnOrdinal;
+            public long ColumnId;
             public string OldValue;
             public string NewValue;
+
+            // —— 批量单元格修改（CellsBatch）——
+            public List<CellUndoItem> BatchCells;
 
             // —— 删除行（DeleteRows）——
             /// <summary>被删行的值，按列顺序（Ordinal）。</summary>
@@ -2362,8 +2825,26 @@ namespace DataManager
             public List<List<long>> DeletedRowTags;
         }
 
+        private AppColumn FindColumnById(long columnId)
+        {
+            if (_table == null)
+            {
+                return null;
+            }
+
+            foreach (AppColumn c in _table.Columns)
+            {
+                if (c.Id == columnId)
+                {
+                    return c;
+                }
+            }
+
+            return null;
+        }
+
         /// <summary>记录一次已落库的单元格值变更，供 Ctrl+Z 恢复。超出上限时丢弃最旧记录。</summary>
-        private void PushUndo(long rowId, int columnOrdinal, string oldValue, string newValue)
+        private void PushUndo(long rowId, long columnId, string oldValue, string newValue)
         {
             if (_table == null)
             {
@@ -2375,9 +2856,27 @@ namespace DataManager
                 Kind = UndoKind.Cell,
                 TableId = _table.Id,
                 RowId = rowId,
-                ColumnOrdinal = columnOrdinal,
+                ColumnId = columnId,
                 OldValue = oldValue ?? string.Empty,
                 NewValue = newValue ?? string.Empty,
+            });
+
+            TrimUndoStack();
+        }
+
+        /// <summary>记录一次批量单元格粘贴修改，作为单步撤销。</summary>
+        private void PushUndoCellsBatch(List<CellUndoItem> items)
+        {
+            if (_table == null || items == null || items.Count == 0)
+            {
+                return;
+            }
+
+            _undoStack.Add(new UndoEntry
+            {
+                Kind = UndoKind.CellsBatch,
+                TableId = _table.Id,
+                BatchCells = items,
             });
 
             TrimUndoStack();
@@ -2411,7 +2910,7 @@ namespace DataManager
         }
 
         /// <summary>
-        /// 撤销最近一次操作（单元格修改或删除行）。返回是否执行了撤销。
+        /// 撤销最近一次操作（单元格修改、批量粘贴或删除行）。返回是否执行了撤销。
         /// </summary>
         private bool Undo()
         {
@@ -2429,26 +2928,30 @@ namespace DataManager
                 return true;
             }
 
-            if (entry.Kind == UndoKind.DeleteRows)
+            switch (entry.Kind)
             {
-                UndoDeleteRows(entry);
-            }
-            else
-            {
-                UndoCell(entry);
+                case UndoKind.DeleteRows:
+                    UndoDeleteRows(entry);
+                    break;
+
+                case UndoKind.CellsBatch:
+                    UndoCellsBatch(entry);
+                    break;
+
+                default:
+                    UndoCell(entry);
+                    break;
             }
 
-            ReloadRows();
-            RebuildTagBar();
+            RefreshAllGroupHeaderCandidates();
+            RefreshView();
             return true;
         }
 
-        /// <summary>撤销一次单元格修改：把旧值写回数据库。</summary>
+        /// <summary>撤销一次单元格修改：按 ColumnId 定位列并把旧值写回数据库。</summary>
         private void UndoCell(UndoEntry entry)
         {
-            AppColumn column = entry.ColumnOrdinal >= 0 && entry.ColumnOrdinal < _table.Columns.Count
-                ? _table.Columns[entry.ColumnOrdinal]
-                : null;
+            AppColumn column = FindColumnById(entry.ColumnId);
             if (column == null)
             {
                 return;
@@ -2461,6 +2964,46 @@ namespace DataManager
             }
         }
 
+        /// <summary>撤销一次批量粘贴：在单个事务内按 ColumnId 逐个恢复旧值，失败整批回滚。</summary>
+        private void UndoCellsBatch(UndoEntry entry)
+        {
+            if (entry.BatchCells == null || entry.BatchCells.Count == 0)
+            {
+                return;
+            }
+
+            string undoError = null;
+            using (SqliteConnection.Tx tx = Data.Connection.Transaction())
+            {
+                for (int i = entry.BatchCells.Count - 1; i >= 0; i--)
+                {
+                    CellUndoItem item = entry.BatchCells[i];
+                    AppColumn column = FindColumnById(item.ColumnId);
+                    if (column == null)
+                    {
+                        continue;
+                    }
+
+                    string error = Data.Rows.UpdateCell(_table, item.RowId, column, item.OldValue);
+                    if (error != null)
+                    {
+                        undoError = error;
+                        break;
+                    }
+                }
+
+                if (undoError == null)
+                {
+                    tx.Complete();
+                }
+            }
+
+            if (undoError != null)
+            {
+                MessageWindow.Show(this, "无法撤销粘贴：" + undoError, "撤销", Dialogs.MessageTone.Warning);
+            }
+        }
+
         /// <summary>撤销一次删除行：把被删的行按原值重新插入，并恢复其行标签。</summary>
         private void UndoDeleteRows(UndoEntry entry)
         {
@@ -2469,6 +3012,7 @@ namespace DataManager
                 return;
             }
 
+            string undoError = null;
             using (SqliteConnection.Tx tx = Data.Connection.Transaction())
             {
                 for (int i = 0; i < entry.DeletedRows.Count; i++)
@@ -2479,8 +3023,8 @@ namespace DataManager
                     string error = Data.Rows.ValidateRow(_table, values, null);
                     if (error != null)
                     {
-                        MessageWindow.Show(this, "无法撤销删除：" + error, "撤销", Dialogs.MessageTone.Warning);
-                        return;
+                        undoError = error;
+                        break;
                     }
 
                     long newRowId = Data.Rows.InsertRow(_table, values);
@@ -2495,7 +3039,15 @@ namespace DataManager
                     }
                 }
 
-                tx.Complete();
+                if (undoError == null)
+                {
+                    tx.Complete();
+                }
+            }
+
+            if (undoError != null)
+            {
+                MessageWindow.Show(this, "无法撤销删除：" + undoError, "撤销", Dialogs.MessageTone.Warning);
             }
         }
     }

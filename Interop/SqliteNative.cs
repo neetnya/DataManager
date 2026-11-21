@@ -60,37 +60,43 @@ namespace DataManager.Interop
         // 打开 / 关闭
         // ---------------------------------------------------------------
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_open_v2")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_open_v2")]
         public static extern int sqlite3_open_v2(byte[] filename, out IntPtr ppDb, int flags, IntPtr zVfs);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_close_v2")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_close_v2")]
         public static extern int sqlite3_close_v2(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_errmsg")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_errmsg")]
         public static extern IntPtr sqlite3_errmsg(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_errcode")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_errcode")]
         public static extern int sqlite3_errcode(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_extended_errcode")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_extended_errcode")]
         public static extern int sqlite3_extended_errcode(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_extended_result_codes")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_extended_result_codes")]
         public static extern int sqlite3_extended_result_codes(IntPtr db, int onoff);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_busy_timeout")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_busy_timeout")]
         public static extern int sqlite3_busy_timeout(IntPtr db, int ms);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_changes")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_changes")]
         public static extern int sqlite3_changes(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_last_insert_rowid")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_last_insert_rowid")]
         public static extern long sqlite3_last_insert_rowid(IntPtr db);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_libversion")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_get_autocommit")]
+        public static extern int sqlite3_get_autocommit(IntPtr db);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_libversion")]
         public static extern IntPtr sqlite3_libversion();
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_errstr")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_libversion_number")]
+        public static extern int sqlite3_libversion_number();
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_errstr")]
         public static extern IntPtr sqlite3_errstr(int resultCode);
 
         /// <summary>
@@ -127,56 +133,56 @@ namespace DataManager.Interop
         // 语句
         // ---------------------------------------------------------------
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_prepare_v2")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_prepare_v2")]
         public static extern int sqlite3_prepare_v2(IntPtr db, byte[] zSql, int nByte, out IntPtr ppStmt, out IntPtr pzTail);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_step")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_step")]
         public static extern int sqlite3_step(IntPtr stmt);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_reset")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_reset")]
         public static extern int sqlite3_reset(IntPtr stmt);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_clear_bindings")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_clear_bindings")]
         public static extern int sqlite3_clear_bindings(IntPtr stmt);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_finalize")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_finalize")]
         public static extern int sqlite3_finalize(IntPtr stmt);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_count")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_column_count")]
         public static extern int sqlite3_column_count(IntPtr stmt);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_type")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_column_type")]
         public static extern int sqlite3_column_type(IntPtr stmt, int iCol);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_text")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_column_text")]
         public static extern IntPtr sqlite3_column_text(IntPtr stmt, int iCol);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_bytes")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_column_bytes")]
         public static extern int sqlite3_column_bytes(IntPtr stmt, int iCol);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_column_int64")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_column_int64")]
         public static extern long sqlite3_column_int64(IntPtr stmt, int iCol);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_bind_null")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_bind_null")]
         public static extern int sqlite3_bind_null(IntPtr stmt, int index);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_bind_int64")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_bind_int64")]
         public static extern int sqlite3_bind_int64(IntPtr stmt, int index, long value);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_bind_text")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_bind_text")]
         public static extern int sqlite3_bind_text(IntPtr stmt, int index, byte[] value, int n, IntPtr destructor);
 
         // ---------------------------------------------------------------
         // 在线备份（用于本地/远端备份，保证拿到一致的数据库快照）
         // ---------------------------------------------------------------
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_backup_init")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_backup_init")]
         public static extern IntPtr sqlite3_backup_init(IntPtr pDest, byte[] zDestName, IntPtr pSource, byte[] zSourceName);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_backup_step")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_backup_step")]
         public static extern int sqlite3_backup_step(IntPtr pBackup, int nPage);
 
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "sqlite3_backup_finish")]
+        [DllImport(Dll, CallingConvention = CallingConvention.Winapi, EntryPoint = "sqlite3_backup_finish")]
         public static extern int sqlite3_backup_finish(IntPtr pBackup);
 
         // ---------------------------------------------------------------

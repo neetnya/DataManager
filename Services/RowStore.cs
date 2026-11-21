@@ -13,6 +13,9 @@ namespace DataManager.Services
         /// <summary>列 Id → 模糊搜索关键字（空/未给出表示不过滤）。</summary>
         public Dictionary<long, string> ColumnFilters { get; } = new Dictionary<long, string>();
 
+        /// <summary>需要筛选“为空（NULL 或空/纯空白）”的列 Id 集合。</summary>
+        public HashSet<long> EmptyColumns { get; } = new HashSet<long>();
+
         /// <summary>标签搜索关键字（独立入口）。</summary>
         public string TagFilter { get; set; }
 
@@ -26,7 +29,7 @@ namespace DataManager.Services
         {
             get
             {
-                if (!string.IsNullOrEmpty(TagFilter) || !string.IsNullOrEmpty(QuickFilterText))
+                if (!string.IsNullOrEmpty(TagFilter) || !string.IsNullOrEmpty(QuickFilterText) || EmptyColumns.Count > 0)
                 {
                     return true;
                 }
@@ -99,7 +102,7 @@ namespace DataManager.Services
         // 查询
         // ---------------------------------------------------------------
 
-        /// <summary>按固定排序优先级生成 ORDER BY 子句。</summary>
+        /// <summary>按固定排序优先级生成 ORDER BY 子句（升序支持 NULLS LAST，末尾追加 rid ASC）。</summary>
         private static string BuildOrderBy(AppTable table)
         {
             var sortCols = new List<AppColumn>();
@@ -121,7 +124,7 @@ namespace DataManager.Services
             if (sortCols.Count == 0)
             {
                 // 没有任何排序列时保持插入顺序，保证结果稳定
-                return " ORDER BY rid";
+                return " ORDER BY rid ASC";
             }
 
             var sb = new StringBuilder(" ORDER BY ");
@@ -132,10 +135,19 @@ namespace DataManager.Services
                     sb.Append(", ");
                 }
 
-                sb.Append(Sql.Ident(sortCols[i].PhysicalName));
-                sb.Append(sortCols[i].SortDescending ? " DESC" : " ASC");
+                string colIdent = Sql.Ident(sortCols[i].PhysicalName);
+                if (sortCols[i].SortDescending)
+                {
+                    sb.Append(colIdent).Append(" DESC");
+                }
+                else
+                {
+                    sb.Append("CASE WHEN ").Append(colIdent).Append(" IS NULL THEN 1 ELSE 0 END, ")
+                      .Append(colIdent).Append(" ASC");
+                }
             }
 
+            sb.Append(", rid ASC");
             return sb.ToString();
         }
 
@@ -152,6 +164,12 @@ namespace DataManager.Services
                     {
                         clauses.Add(Sql.Ident(c.PhysicalName) + " LIKE ? ESCAPE '\\'");
                         args.Add("%" + Sql.EscapeLike(keyword) + "%");
+                    }
+
+                    if (spec.EmptyColumns != null && spec.EmptyColumns.Contains(c.Id))
+                    {
+                        string colExpr = Sql.Ident(c.PhysicalName);
+                        clauses.Add("(" + colExpr + " IS NULL OR TRIM(" + colExpr + ") = '')");
                     }
                 }
 
@@ -218,46 +236,42 @@ namespace DataManager.Services
 
         /// <summary>
         /// 生成“单元格值按分隔符拆分后是否包含某个分组值”的 SQL 条件。
-        /// cellExpr 为单元格列表达式，valueExpr 为分组值表达式。
-        /// 分隔符为空时退化为精确相等。
+        /// 使用大小写敏感的 instr 精确匹配，避免 LIKE 通配符注入与大小写不一致。
+        /// 分隔符为空时退化为 Trim 后的精确相等。
         /// </summary>
         private static string BuildGroupValueMatchSql(string cellExpr, string valueExpr)
         {
             string sep = GroupValueSplitter.Separator;
             if (string.IsNullOrEmpty(sep))
             {
-                return cellExpr + " = " + valueExpr;
+                return "(" + cellExpr + " IS NOT NULL AND TRIM(" + cellExpr + ") = TRIM(" + valueExpr + "))";
             }
 
-            string sepLit = Sql.Literal(Sql.EscapeLike(sep));
-            return "(" + cellExpr + " = " + valueExpr +
-                " OR " + cellExpr + " LIKE (" + valueExpr + " || " + sepLit + " || '%') ESCAPE '\\'" +
-                " OR " + cellExpr + " LIKE ('%' || " + sepLit + " || " + valueExpr + " || " + sepLit + " || '%') ESCAPE '\\'" +
-                " OR " + cellExpr + " LIKE ('%' || " + sepLit + " || " + valueExpr + ") ESCAPE '\\')";
+            string sepLit = Sql.Literal(sep);
+            return "(" + cellExpr + " IS NOT NULL AND instr(" +
+                   sepLit + " || TRIM(" + cellExpr + ") || " + sepLit + ", " +
+                   sepLit + " || TRIM(" + valueExpr + ") || " + sepLit + ") > 0)";
         }
 
         /// <summary>
         /// 按条件读取数据行。参数 applySort 为 true 时应用固定排序；
-        /// 传 false 时按插入顺序返回（是否重排由调用方决定）。
+        /// 传 false 时按 rid 升序返回（是否重排由调用方决定）。
         /// </summary>
         public List<DataRow> Query(AppTable table, QuerySpec spec, bool applySort = true)
         {
             var args = new List<string>();
-            string sql = "SELECT rid";
+            var sql = new StringBuilder("SELECT rid");
             foreach (AppColumn c in table.Columns)
             {
-                sql += ", " + Sql.Ident(c.PhysicalName);
+                sql.Append(", ").Append(Sql.Ident(c.PhysicalName));
             }
 
-            sql += " FROM " + Physical(table);
-            sql += BuildWhere(table, spec, args);
-            if (applySort)
-            {
-                sql += BuildOrderBy(table);
-            }
+            sql.Append(" FROM ").Append(Physical(table));
+            sql.Append(BuildWhere(table, spec, args));
+            sql.Append(applySort ? BuildOrderBy(table) : " ORDER BY rid");
 
             var rows = new List<DataRow>();
-            using (SqliteStatement st = _db.Prepare(sql))
+            using (SqliteStatement st = _db.Prepare(sql.ToString()))
             {
                 for (int i = 0; i < args.Count; i++)
                 {
@@ -283,15 +297,15 @@ namespace DataManager.Services
         /// <summary>读取某一行。</summary>
         public DataRow GetRow(AppTable table, long rowId)
         {
-            string sql = "SELECT rid";
+            var sql = new StringBuilder("SELECT rid");
             foreach (AppColumn c in table.Columns)
             {
-                sql += ", " + Sql.Ident(c.PhysicalName);
+                sql.Append(", ").Append(Sql.Ident(c.PhysicalName));
             }
 
-            sql += " FROM " + Physical(table) + " WHERE rid = ?";
+            sql.Append(" FROM ").Append(Physical(table)).Append(" WHERE rid = ?");
 
-            using (SqliteStatement st = _db.Prepare(sql))
+            using (SqliteStatement st = _db.Prepare(sql.ToString()))
             {
                 st.Bind(1, rowId);
                 if (st.Read())
@@ -309,13 +323,101 @@ namespace DataManager.Services
             return null;
         }
 
+        /// <summary>按行号集合批量读取行数据（用于批量删除撤销等场景）。</summary>
+        public List<DataRow> GetRowsByIds(AppTable table, IEnumerable<long> rowIds)
+        {
+            var result = new List<DataRow>();
+            if (table == null || rowIds == null)
+            {
+                return result;
+            }
+
+            var ids = new List<long>();
+            var seen = new HashSet<long>();
+            foreach (long id in rowIds)
+            {
+                if (seen.Add(id))
+                {
+                    ids.Add(id);
+                }
+            }
+
+            if (ids.Count == 0)
+            {
+                return result;
+            }
+
+            var prefix = new StringBuilder("SELECT rid");
+            foreach (AppColumn c in table.Columns)
+            {
+                prefix.Append(", ").Append(Sql.Ident(c.PhysicalName));
+            }
+
+            prefix.Append(" FROM ").Append(Physical(table)).Append(" WHERE rid IN (");
+            string prefixStr = prefix.ToString();
+
+            int colCount = table.Columns.Count;
+            var byId = new Dictionary<long, DataRow>(ids.Count);
+
+            const int ChunkSize = 500;
+            for (int offset = 0; offset < ids.Count; offset += ChunkSize)
+            {
+                int count = Math.Min(ChunkSize, ids.Count - offset);
+                var sb = new StringBuilder(prefixStr.Length + count * 3 + 2);
+                sb.Append(prefixStr);
+                for (int i = 0; i < count; i++)
+                {
+                    if (i > 0)
+                    {
+                        sb.Append(", ");
+                    }
+
+                    sb.Append('?');
+                }
+
+                sb.Append(')');
+
+                using (SqliteStatement st = _db.Prepare(sb.ToString()))
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        st.Bind(i + 1, ids[offset + i]);
+                    }
+
+                    while (st.Read())
+                    {
+                        long rid = st.GetInt64(0);
+                        var values = new string[colCount];
+                        for (int i = 0; i < colCount; i++)
+                        {
+                            values[i] = st.GetString(i + 1) ?? string.Empty;
+                        }
+
+                        byId[rid] = new DataRow(rid, values);
+                    }
+                }
+            }
+
+            foreach (long id in ids)
+            {
+                if (byId.TryGetValue(id, out DataRow row))
+                {
+                    result.Add(row);
+                }
+            }
+
+            return result;
+        }
+
         /// <summary>某列当前已有的值（去重，用于分组下拉）。分组列按分隔符拆分后去重。</summary>
         public List<string> DistinctValues(AppTable table, AppColumn column)
         {
             var list = new List<string>();
-            string sql = "SELECT DISTINCT " + Sql.Ident(column.PhysicalName) + " FROM " + Physical(table) +
-                         " WHERE " + Sql.Ident(column.PhysicalName) + " IS NOT NULL AND " + Sql.Ident(column.PhysicalName) + " <> ''" +
-                         " ORDER BY " + Sql.Ident(column.PhysicalName);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            string colIdent = Sql.Ident(column.PhysicalName);
+            string sql = "SELECT DISTINCT " + colIdent + " FROM " + Physical(table) +
+                         " WHERE " + colIdent + " IS NOT NULL AND " + colIdent + " <> ''" +
+                         " ORDER BY " + colIdent;
 
             using (SqliteStatement st = _db.Prepare(sql))
             {
@@ -326,13 +428,13 @@ namespace DataManager.Services
                     {
                         foreach (string part in GroupValueSplitter.Split(raw))
                         {
-                            if (!list.Contains(part))
+                            if (seen.Add(part))
                             {
                                 list.Add(part);
                             }
                         }
                     }
-                    else if (raw.Length > 0 && !list.Contains(raw))
+                    else if (raw.Length > 0 && seen.Add(raw))
                     {
                         list.Add(raw);
                     }
@@ -413,8 +515,8 @@ namespace DataManager.Services
                 throw new InvalidOperationException("该表还没有任何列，无法添加数据。");
             }
 
-            var names = new List<string>();
-            var placeholders = new List<string>();
+            var names = new List<string>(table.Columns.Count);
+            var placeholders = new List<string>(table.Columns.Count);
             for (int i = 0; i < table.Columns.Count; i++)
             {
                 names.Add(Sql.Ident(table.Columns[i].PhysicalName));
@@ -424,75 +526,91 @@ namespace DataManager.Services
             string sql = "INSERT INTO " + Physical(table) +
                          " (" + string.Join(", ", names) + ") VALUES (" + string.Join(", ", placeholders) + ")";
 
-            using (SqliteStatement st = _db.Prepare(sql))
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                for (int i = 0; i < table.Columns.Count; i++)
+                using (SqliteStatement st = _db.Prepare(sql))
                 {
-                    string v = i < values.Length ? values[i] : null;
-                    st.Bind(i + 1, string.IsNullOrEmpty(v) ? null : v);
+                    for (int i = 0; i < table.Columns.Count; i++)
+                    {
+                        string v = values != null && i < values.Length ? values[i] : null;
+                        st.Bind(i + 1, string.IsNullOrEmpty(v) ? null : v);
+                    }
+
+                    st.Step();
                 }
 
-                st.Step();
+                long rowId = _db.LastInsertRowId;
+                tx.Complete();
+                return rowId;
             }
-
-            long rowId = _db.LastInsertRowId;
-            ReconcileGroupsAfterWrite(table);
-            return rowId;
         }
 
         /// <summary>更新一个单元格。返回 null 表示成功，否则为错误提示。</summary>
         public string UpdateCell(AppTable table, long rowId, AppColumn column, string value)
         {
-            string error = ValidateUnique(table, column, value, rowId);
-            if (error != null)
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                return error;
+                string error = ValidateUnique(table, column, value, rowId);
+                if (error != null)
+                {
+                    return error;
+                }
+
+                _db.Execute(
+                    "UPDATE " + Physical(table) + " SET " + Sql.Ident(column.PhysicalName) + " = ? WHERE rid = ?",
+                    string.IsNullOrEmpty(value) ? null : value,
+                    rowId.ToString(CultureInfo.InvariantCulture));
+
+                if (column.IsGroup)
+                {
+                    // 旧值若已无任何数据引用，其标签一并删除
+                    _schema.ReconcileGroupValue(table.Id, column);
+                }
+
+                tx.Complete();
+                return null;
             }
-
-            _db.Execute(
-                "UPDATE " + Physical(table) + " SET " + Sql.Ident(column.PhysicalName) + " = ? WHERE rid = ?",
-                string.IsNullOrEmpty(value) ? null : value,
-                rowId.ToString(CultureInfo.InvariantCulture));
-
-            if (column.IsGroup)
-            {
-                // 旧值若已无任何数据引用，其标签一并删除
-                _schema.ReconcileGroupValue(table.Id, column);
-            }
-
-            return null;
         }
 
         /// <summary>更新整行。返回 null 表示成功，否则为错误提示。</summary>
         public string UpdateRow(AppTable table, long rowId, string[] values)
         {
-            string error = ValidateRow(table, values, rowId);
-            if (error != null)
+            if (table.Columns.Count == 0)
             {
-                return error;
+                return null;
             }
 
-            var sets = new List<string>();
-            for (int i = 0; i < table.Columns.Count; i++)
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                sets.Add(Sql.Ident(table.Columns[i].PhysicalName) + " = ?");
-            }
-
-            using (SqliteStatement st = _db.Prepare(
-                "UPDATE " + Physical(table) + " SET " + string.Join(", ", sets) + " WHERE rid = ?"))
-            {
-                for (int i = 0; i < table.Columns.Count; i++)
+                string error = ValidateRow(table, values, rowId);
+                if (error != null)
                 {
-                    string v = i < values.Length ? values[i] : null;
-                    st.Bind(i + 1, string.IsNullOrEmpty(v) ? null : v);
+                    return error;
                 }
 
-                st.Bind(table.Columns.Count + 1, rowId);
-                st.Step();
-            }
+                var sets = new List<string>(table.Columns.Count);
+                for (int i = 0; i < table.Columns.Count; i++)
+                {
+                    sets.Add(Sql.Ident(table.Columns[i].PhysicalName) + " = ?");
+                }
 
-            ReconcileGroupsAfterWrite(table);
-            return null;
+                using (SqliteStatement st = _db.Prepare(
+                    "UPDATE " + Physical(table) + " SET " + string.Join(", ", sets) + " WHERE rid = ?"))
+                {
+                    for (int i = 0; i < table.Columns.Count; i++)
+                    {
+                        string v = values != null && i < values.Length ? values[i] : null;
+                        st.Bind(i + 1, string.IsNullOrEmpty(v) ? null : v);
+                    }
+
+                    st.Bind(table.Columns.Count + 1, rowId);
+                    st.Step();
+                }
+
+                ReconcileGroupsAfterWrite(table);
+                tx.Complete();
+                return null;
+            }
         }
 
         private void ReconcileGroupsAfterWrite(AppTable table)
@@ -542,8 +660,9 @@ namespace DataManager.Services
         public QuickQueryResult QuickQuery(AppTable table, string clipboardText)
         {
             var result = new QuickQueryResult();
+            string text = clipboardText ?? string.Empty;
 
-            if (!table.HasQuickQuery)
+            if (!table.HasQuickQuery || string.IsNullOrEmpty(text))
             {
                 result.Outcome = QuickQueryOutcome.None;
                 return result;
@@ -551,12 +670,12 @@ namespace DataManager.Services
 
             AppColumn source = table.QuickColumn;
             AppColumn target = table.QueriedColumn;
-            string text = clipboardText ?? string.Empty;
 
-            // 1) 精确命中（大小写不敏感）
+            // 1) 精确命中（大小写不敏感，按固定排序顺序取首行保证稳定）
             string exactSql =
                 "SELECT rid, " + Sql.Ident(target.PhysicalName) + " FROM " + Physical(table) +
-                " WHERE " + Sql.Ident(source.PhysicalName) + " = ? COLLATE NOCASE LIMIT 1";
+                " WHERE " + Sql.Ident(source.PhysicalName) + " = ? COLLATE NOCASE" +
+                BuildOrderBy(table) + " LIMIT 1";
 
             using (SqliteStatement st = _db.Prepare(exactSql))
             {

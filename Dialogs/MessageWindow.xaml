@@ -4,31 +4,44 @@
         Title="提示"
         MinWidth="360"
         MaxWidth="560"
+        MaxHeight="520"
         SizeToContent="WidthAndHeight"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <Border Padding="22,20,22,16">
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <StackPanel Grid.Row="0" Orientation="Horizontal">
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
                 <TextBlock x:Name="TxtIcon"
+                           Grid.Column="0"
                            FontSize="20"
                            VerticalAlignment="Top"
                            Margin="0,0,12,0" />
-                <TextBlock x:Name="TxtMessage"
-                           Foreground="{StaticResource TextBrush}"
-                           FontSize="13"
-                           TextWrapping="Wrap"
-                           MaxWidth="440"
-                           VerticalAlignment="Center" />
-            </StackPanel>
+                <ScrollViewer Grid.Column="1"
+                              MaxHeight="360"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <TextBlock x:Name="TxtMessage"
+                               Foreground="{StaticResource TextBrush}"
+                               FontSize="13"
+                               TextWrapping="Wrap"
+                               MaxWidth="440"
+                               VerticalAlignment="Center" />
+                </ScrollViewer>
+            </Grid>
 
             <StackPanel x:Name="Buttons"
                         Grid.Row="1"

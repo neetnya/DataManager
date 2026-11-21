@@ -8,6 +8,7 @@
         MinHeight="520"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <Grid>
@@ -34,13 +35,16 @@
                 <GroupBox Header="本地备份">
                     <StackPanel>
                         <StackPanel Orientation="Horizontal">
-                            <Button Content="立即备份"
+                            <Button x:Name="BtnLocalBackup"
+                                    Content="立即备份"
                                     Style="{StaticResource PrimaryButton}"
                                     Click="OnLocalBackup" />
-                            <Button Content="打开备份文件夹"
+                            <Button x:Name="BtnOpenBackupFolder"
+                                    Content="打开备份文件夹"
                                     Margin="8,0,0,0"
                                     Click="OnOpenBackupFolder" />
-                            <Button Content="刷新列表"
+                            <Button x:Name="BtnRefreshBackups"
+                                    Content="刷新列表"
                                     Margin="8,0,0,0"
                                     Click="OnRefreshBackups" />
                         </StackPanel>
@@ -77,10 +81,11 @@
                         </DataGrid>
 
                         <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
-                            <Button Content="恢复选中的本地备份"
+                            <Button x:Name="BtnRestoreLocal"
+                                    Content="恢复选中的本地备份"
                                     Style="{StaticResource DangerButton}"
                                     Click="OnRestoreLocal" />
-                            <Button x:Name="BtnDeleteBackup"
+                            <Button x:Name="BtnDeleteLocal"
                                     Content="删除选中备份"
                                     Margin="8,0,0,0"
                                     Click="OnDeleteBackup" />
@@ -94,7 +99,8 @@
                             <TextBox x:Name="TxtKeepCount"
                                      Width="70"
                                      Text="0" />
-                            <Button Content="应用保留策略"
+                            <Button x:Name="BtnApplyKeep"
+                                    Content="应用保留策略"
                                     Margin="8,0,0,0"
                                     Click="OnApplyRetention" />
                         </StackPanel>
@@ -163,12 +169,15 @@
                         </Grid>
 
                         <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
-                            <Button Content="保存配置"
+                            <Button x:Name="BtnSaveConfig"
+                                    Content="保存配置"
                                     Click="OnSaveDavConfig" />
-                            <Button Content="测试连接"
+                            <Button x:Name="BtnTestConn"
+                                    Content="测试连接"
                                     Margin="8,0,0,0"
                                     Click="OnTestConnection" />
-                            <Button Content="上传到 WebDAV"
+                            <Button x:Name="BtnUpload"
+                                    Content="上传到 WebDAV"
                                     Style="{StaticResource PrimaryButton}"
                                     Margin="8,0,0,0"
                                     Click="OnUpload" />
@@ -213,7 +222,13 @@
                             <Button x:Name="BtnRestoreRemote"
                                     Content="从选中的远端备份恢复"
                                     Style="{StaticResource DangerButton}"
+                                    IsEnabled="False"
                                     Click="OnDownloadAndRestore" />
+                            <Button x:Name="BtnDeleteRemote"
+                                    Content="删除选中的远端备份"
+                                    Margin="8,0,0,0"
+                                    IsEnabled="False"
+                                    Click="OnDeleteRemote" />
                             <TextBlock x:Name="TxtRemoteStatus"
                                        Style="{StaticResource HintText}"
                                        Margin="10,0,0,0"

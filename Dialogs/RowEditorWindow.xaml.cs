@@ -16,6 +16,10 @@ namespace DataManager
         private readonly DataRow _existing;
         private readonly AppData _data;
         private readonly List<Control> _inputs = new List<Control>();
+        private int _addedCount;
+
+        /// <summary>窗口内是否至少成功保存过一次（含“继续添加”后点取消的情况）。</summary>
+        public bool Changed { get; private set; }
 
         public RowEditorWindow(AppTable table, DataRow existing, AppData data)
         {
@@ -32,6 +36,32 @@ namespace DataManager
             }
 
             BuildFields();
+            Loaded += OnLoaded;
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            if (_inputs.Count == 0)
+            {
+                return;
+            }
+
+            Control first = _inputs[0];
+            if (first is ComboBox combo && combo.IsEditable && combo.Template != null)
+            {
+                if (combo.Template.FindName("PART_EditableTextBox", combo) is TextBox editableBox)
+                {
+                    editableBox.Focus();
+                    editableBox.SelectAll();
+                    return;
+                }
+            }
+
+            first.Focus();
+            if (first is TextBox box)
+            {
+                box.SelectAll();
+            }
         }
 
         private void BuildFields()
@@ -84,10 +114,26 @@ namespace DataManager
                 _inputs.Add(input);
                 Fields.Children.Add(input);
             }
+        }
 
-            if (_table.Columns.Count > 0)
+        /// <summary>连续添加后刷新各分组列的下拉候选值，同时保留当前输入框内容。</summary>
+        private void RefreshGroupCandidates()
+        {
+            for (int i = 0; i < _inputs.Count; i++)
             {
-                _inputs[0].Focus();
+                if (!(_inputs[i] is ComboBox combo) || !(combo.Tag is AppColumn column) || !column.IsGroup)
+                {
+                    continue;
+                }
+
+                string currentText = combo.Text;
+                combo.Items.Clear();
+                foreach (string candidate in _data.Rows.DistinctValues(_table, column))
+                {
+                    combo.Items.Add(candidate);
+                }
+
+                combo.Text = currentText;
             }
         }
 
@@ -150,7 +196,12 @@ namespace DataManager
         /// <summary>保存成功后立即插入数据、不关闭窗口，且不清空表单，方便连续录入相近的多条。</summary>
         private void OnContinueAdd(object sender, RoutedEventArgs e)
         {
-            TrySave();
+            if (TrySave())
+            {
+                _addedCount++;
+                TxtAddStatus.Text = "已添加 " + _addedCount.ToString(CultureInfo.InvariantCulture) + " 条";
+                RefreshGroupCandidates();
+            }
         }
 
         /// <summary>把当前表单内容写入数据表；成功返回 true。</summary>
@@ -187,6 +238,7 @@ namespace DataManager
                 return false;
             }
 
+            Changed = true;
             return true;
         }
 

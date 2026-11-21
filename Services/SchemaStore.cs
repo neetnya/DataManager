@@ -32,10 +32,11 @@ namespace DataManager.Services
         {
             _db.Execute(@"
 CREATE TABLE IF NOT EXISTS meta_table (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    next_col_seq INTEGER NOT NULL DEFAULT 0
 )");
 
             _db.Execute(@"
@@ -72,11 +73,14 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
     group_value TEXT
 )");
 
+            // 删除已被覆盖的冗余索引
+            _db.Execute("DROP INDEX IF EXISTS ix_meta_tag_table");
+            _db.Execute("DROP INDEX IF EXISTS ix_meta_tag_link_table");
+
             _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_column_table ON meta_column(table_id, ordinal)");
-            _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_tag_table ON meta_tag(table_id, name)");
             _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_tag_link_tag ON meta_tag_link(tag_id)");
-            _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_tag_link_table ON meta_tag_link(table_id)");
             _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_tag_link_row ON meta_tag_link(table_id, row_id)");
+            _db.Execute("CREATE INDEX IF NOT EXISTS ix_meta_tag_link_group ON meta_tag_link(table_id, scope, column_id)");
             _db.Execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_meta_tag_name ON meta_tag(table_id, name)");
 
             Migrate();
@@ -94,6 +98,97 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
             {
                 _db.Execute("ALTER TABLE meta_column ADD COLUMN is_url INTEGER NOT NULL DEFAULT 0");
             }
+
+            if (!ColumnExists("meta_table", "next_col_seq"))
+            {
+                using (SqliteConnection.Tx tx = _db.Transaction())
+                {
+                    _db.Execute("ALTER TABLE meta_table ADD COLUMN next_col_seq INTEGER NOT NULL DEFAULT 0");
+                    InitializeNextColSeqForExistingTables();
+                    tx.Complete();
+                }
+            }
+
+            // 清理历史脏数据（空分组值或重复分组值绑定）后建立防重唯一索引
+            using (SqliteConnection.Tx tx = _db.Transaction())
+            {
+                _db.Execute("DELETE FROM meta_tag_link WHERE scope = 1 AND (group_value IS NULL OR TRIM(group_value) = '')");
+                _db.Execute(
+                    "DELETE FROM meta_tag_link WHERE scope = 1 AND id NOT IN (" +
+                    "SELECT MIN(id) FROM meta_tag_link WHERE scope = 1 GROUP BY table_id, tag_id, column_id, group_value)");
+                _db.Execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_meta_tag_link_group " +
+                    "ON meta_tag_link(table_id, tag_id, column_id, group_value) WHERE scope = 1");
+                tx.Complete();
+            }
+        }
+
+        private void InitializeNextColSeqForExistingTables()
+        {
+            var tableIds = new List<long>();
+            using (SqliteStatement st = _db.Prepare("SELECT id FROM meta_table"))
+            {
+                while (st.Read())
+                {
+                    tableIds.Add(st.GetInt64(0));
+                }
+            }
+
+            foreach (long tableId in tableIds)
+            {
+                int maxNum = GetMaxPhysicalColumnNumber(tableId);
+                int nextSeq = maxNum + 1;
+                _db.Execute(
+                    "UPDATE meta_table SET next_col_seq = ? WHERE id = ?",
+                    nextSeq.ToString(CultureInfo.InvariantCulture),
+                    tableId.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+
+        private int GetMaxPhysicalColumnNumber(long tableId)
+        {
+            int max = -1;
+            using (SqliteStatement st = _db.Prepare("SELECT col_name FROM meta_column WHERE table_id = ?"))
+            {
+                st.Bind(1, tableId);
+                while (st.Read())
+                {
+                    int v = ParsePhysicalColumnNumber(st.GetString(0));
+                    if (v > max)
+                    {
+                        max = v;
+                    }
+                }
+            }
+
+            if (PhysicalTableExists(tableId))
+            {
+                string tableName = "t_" + tableId.ToString(CultureInfo.InvariantCulture);
+                using (SqliteStatement st = _db.Prepare("PRAGMA table_info(" + Sql.Ident(tableName) + ")"))
+                {
+                    while (st.Read())
+                    {
+                        int v = ParsePhysicalColumnNumber(st.GetString(1));
+                        if (v > max)
+                        {
+                            max = v;
+                        }
+                    }
+                }
+            }
+
+            return max;
+        }
+
+        private static int ParsePhysicalColumnNumber(string name)
+        {
+            if (!string.IsNullOrEmpty(name) && name.Length > 1 && name[0] == 'c' &&
+                int.TryParse(name.Substring(1), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v))
+            {
+                return v;
+            }
+
+            return -1;
         }
 
         private bool ColumnExists(string table, string column)
@@ -241,20 +336,25 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         /// <summary>创建一张新表（只有元数据，尚无列）。</summary>
         public long CreateTable(string name)
         {
-            using (SqliteStatement st = _db.Prepare(
-                "INSERT INTO meta_table (name, sort_order, created_at) VALUES (?, ?, ?)"))
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                st.Bind(1, name ?? string.Empty);
-                st.Bind(2, NextTableSortOrder());
-                st.Bind(3, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
-                st.Step();
+                using (SqliteStatement st = _db.Prepare(
+                    "INSERT INTO meta_table (name, sort_order, created_at, next_col_seq) VALUES (?, ?, ?, 0)"))
+                {
+                    st.Bind(1, name ?? string.Empty);
+                    st.Bind(2, NextTableSortOrder());
+                    st.Bind(3, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                    st.Step();
+                }
+
+                long id = _db.LastInsertRowId;
+
+                // 真实表一开始只有主键列，后续加列用 ALTER TABLE
+                _db.Execute("CREATE TABLE " + Sql.Ident("t_" + id.ToString(CultureInfo.InvariantCulture)) + " (rid INTEGER PRIMARY KEY AUTOINCREMENT)");
+
+                tx.Complete();
+                return id;
             }
-
-            long id = _db.LastInsertRowId;
-
-            // 真实表一开始只有主键列，后续加列用 ALTER TABLE
-            _db.Execute("CREATE TABLE " + Sql.Ident("t_" + id.ToString(CultureInfo.InvariantCulture)) + " (rid INTEGER PRIMARY KEY AUTOINCREMENT)");
-            return id;
         }
 
         private long NextTableSortOrder()
@@ -272,11 +372,15 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         public void DropTable(long tableId)
         {
             string tid = tableId.ToString(CultureInfo.InvariantCulture);
-            _db.Execute("DROP TABLE IF EXISTS " + Sql.Ident("t_" + tid));
-            _db.Execute("DELETE FROM meta_column WHERE table_id = ?", tid);
-            _db.Execute("DELETE FROM meta_tag_link WHERE table_id = ?", tid);
-            _db.Execute("DELETE FROM meta_tag WHERE table_id = ?", tid);
-            _db.Execute("DELETE FROM meta_table WHERE id = ?", tid);
+            using (SqliteConnection.Tx tx = _db.Transaction())
+            {
+                _db.Execute("DROP TABLE IF EXISTS " + Sql.Ident("t_" + tid));
+                _db.Execute("DELETE FROM meta_column WHERE table_id = ?", tid);
+                _db.Execute("DELETE FROM meta_tag_link WHERE table_id = ?", tid);
+                _db.Execute("DELETE FROM meta_tag WHERE table_id = ?", tid);
+                _db.Execute("DELETE FROM meta_table WHERE id = ?", tid);
+                tx.Complete();
+            }
         }
 
         /// <summary>统计某张表的数据行数（用于删除确认提示）。</summary>
@@ -303,74 +407,76 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         /// <summary>为某张表追加一个新列（立刻 ALTER TABLE 加真实列）。</summary>
         public AppColumn AddColumn(long tableId, ColumnFlags flags, bool sortDescending)
         {
-            int ordinal = (int)_db.ScalarLong(
-                "SELECT IFNULL(MAX(ordinal), -1) + 1 FROM meta_column WHERE table_id = ?",
-                tableId.ToString(CultureInfo.InvariantCulture));
-
-            // 分配一个永不复用的物理列名，避免删列后重名
-            string physical = NextPhysicalColumnName(tableId);
-
-            // 排序优先级默认与建表顺序一致
-            int sortPriority = (int)_db.ScalarLong(
-                "SELECT IFNULL(MAX(sort_prio), -1) + 1 FROM meta_column WHERE table_id = ?",
-                tableId.ToString(CultureInfo.InvariantCulture));
-
-            _db.Execute(
-                "ALTER TABLE " + Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture)) +
-                " ADD COLUMN " + Sql.Ident(physical) + " TEXT");
-
-            using (SqliteStatement st = _db.Prepare(
-                "INSERT INTO meta_column (table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, is_url, sort_desc, sort_prio) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                st.Bind(1, tableId);
-                st.Bind(2, ordinal);
-                st.Bind(3, physical);
-                st.Bind(4, (flags & ColumnFlags.Quick) != 0 ? 1L : 0L);
-                st.Bind(5, (flags & ColumnFlags.Queried) != 0 ? 1L : 0L);
-                st.Bind(6, (flags & ColumnFlags.Unique) != 0 ? 1L : 0L);
-                st.Bind(7, (flags & ColumnFlags.Group) != 0 ? 1L : 0L);
-                st.Bind(8, (flags & ColumnFlags.Sort) != 0 ? 1L : 0L);
-                st.Bind(9, (flags & ColumnFlags.Url) != 0 ? 1L : 0L);
-                st.Bind(10, sortDescending ? 1L : 0L);
-                st.Bind(11, (long)sortPriority);
-                st.Step();
+                string tid = tableId.ToString(CultureInfo.InvariantCulture);
+                int ordinal = (int)_db.ScalarLong(
+                    "SELECT IFNULL(MAX(ordinal), -1) + 1 FROM meta_column WHERE table_id = ?",
+                    tid);
+
+                // 分配一个单调递增、永不复用的物理列名，避免删列后重名
+                string physical = NextPhysicalColumnName(tableId);
+
+                // 排序优先级默认与建表顺序一致
+                int sortPriority = (int)_db.ScalarLong(
+                    "SELECT IFNULL(MAX(sort_prio), -1) + 1 FROM meta_column WHERE table_id = ?",
+                    tid);
+
+                _db.Execute(
+                    "ALTER TABLE " + Sql.Ident("t_" + tid) +
+                    " ADD COLUMN " + Sql.Ident(physical) + " TEXT");
+
+                using (SqliteStatement st = _db.Prepare(
+                    "INSERT INTO meta_column (table_id, ordinal, col_name, is_quick, is_queried, is_unique, is_group, is_sort, is_url, sort_desc, sort_prio) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+                {
+                    st.Bind(1, tableId);
+                    st.Bind(2, ordinal);
+                    st.Bind(3, physical);
+                    st.Bind(4, (flags & ColumnFlags.Quick) != 0 ? 1L : 0L);
+                    st.Bind(5, (flags & ColumnFlags.Queried) != 0 ? 1L : 0L);
+                    st.Bind(6, (flags & ColumnFlags.Unique) != 0 ? 1L : 0L);
+                    st.Bind(7, (flags & ColumnFlags.Group) != 0 ? 1L : 0L);
+                    st.Bind(8, (flags & ColumnFlags.Sort) != 0 ? 1L : 0L);
+                    st.Bind(9, (flags & ColumnFlags.Url) != 0 ? 1L : 0L);
+                    st.Bind(10, sortDescending ? 1L : 0L);
+                    st.Bind(11, (long)sortPriority);
+                    st.Step();
+                }
+
+                long id = _db.LastInsertRowId;
+                tx.Complete();
+
+                return new AppColumn
+                {
+                    Id = id,
+                    TableId = tableId,
+                    Ordinal = ordinal,
+                    PhysicalName = physical,
+                    Flags = flags,
+                    SortDescending = sortDescending,
+                    SortPriority = sortPriority,
+                };
             }
-
-            long id = _db.LastInsertRowId;
-            return new AppColumn
-            {
-                Id = id,
-                TableId = tableId,
-                Ordinal = ordinal,
-                PhysicalName = physical,
-                Flags = flags,
-                SortDescending = sortDescending,
-                SortPriority = sortPriority,
-            };
         }
 
         private string NextPhysicalColumnName(long tableId)
         {
-            int max = -1;
-            using (SqliteStatement st = _db.Prepare("SELECT col_name FROM meta_column WHERE table_id = ?"))
+            string tid = tableId.ToString(CultureInfo.InvariantCulture);
+            int seq = (int)_db.ScalarLong("SELECT IFNULL(next_col_seq, 0) FROM meta_table WHERE id = ?", tid);
+
+            int maxExisting = GetMaxPhysicalColumnNumber(tableId);
+            if (seq <= maxExisting)
             {
-                st.Bind(1, tableId);
-                while (st.Read())
-                {
-                    string n = st.GetString(0);
-                    if (!string.IsNullOrEmpty(n) && n.Length > 1 && n[0] == 'c' &&
-                        int.TryParse(n.Substring(1), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v))
-                    {
-                        if (v > max)
-                        {
-                            max = v;
-                        }
-                    }
-                }
+                seq = maxExisting + 1;
             }
 
-            return Sql.ColumnName(max + 1);
+            _db.Execute(
+                "UPDATE meta_table SET next_col_seq = ? WHERE id = ?",
+                (seq + 1).ToString(CultureInfo.InvariantCulture),
+                tid);
+
+            return Sql.ColumnName(seq);
         }
 
         /// <summary>删除列：该列数据一并删除。</summary>
@@ -378,33 +484,139 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         {
             string tid = column.TableId.ToString(CultureInfo.InvariantCulture);
             string cid = column.Id.ToString(CultureInfo.InvariantCulture);
+            string tableName = "t_" + tid;
 
-            _db.Execute(
-                "ALTER TABLE " + Sql.Ident("t_" + tid) + " DROP COLUMN " + Sql.Ident(column.PhysicalName));
+            using (SqliteConnection.Tx tx = _db.Transaction())
+            {
+                if (SqliteNative.sqlite3_libversion_number() >= 3035000)
+                {
+                    _db.Execute(
+                        "ALTER TABLE " + Sql.Ident(tableName) + " DROP COLUMN " + Sql.Ident(column.PhysicalName));
+                }
+                else
+                {
+                    DropPhysicalColumnByRebuild(tableName, column.PhysicalName);
+                }
 
-            // 挂在“该分组列的值”上的标签绑定随之失效
-            _db.Execute("DELETE FROM meta_tag_link WHERE table_id = ? AND column_id = ?", tid, cid);
-            _db.Execute("DELETE FROM meta_column WHERE id = ?", cid);
-            PurgeOrphanTags(column.TableId);
+                // 挂在“该分组列的值”上的标签绑定随之失效
+                _db.Execute("DELETE FROM meta_tag_link WHERE table_id = ? AND column_id = ?", tid, cid);
+                _db.Execute("DELETE FROM meta_column WHERE id = ?", cid);
+                PurgeOrphanTags(column.TableId);
+
+                tx.Complete();
+            }
+
+            // 清理已保存的对应列宽
+            Dictionary<string, Dictionary<string, double>> widths = App.Settings?.ColumnWidths;
+            if (widths != null &&
+                widths.TryGetValue(tid, out Dictionary<string, double> colMap) &&
+                colMap != null &&
+                !string.IsNullOrEmpty(column.PhysicalName))
+            {
+                colMap.Remove(column.PhysicalName);
+            }
+        }
+
+        /// <summary>
+        /// SQLite &lt; 3.35.0 不支持 ALTER TABLE DROP COLUMN 时的标准兼容路径：
+        /// 建新表 → 拷贝剩余列数据 → 删除旧表 → 重命名新表。
+        /// </summary>
+        private void DropPhysicalColumnByRebuild(string tableName, string dropColumnName)
+        {
+            var keepCols = new List<string>();
+            using (SqliteStatement st = _db.Prepare("PRAGMA table_info(" + Sql.Ident(tableName) + ")"))
+            {
+                while (st.Read())
+                {
+                    string colName = st.GetString(1);
+                    if (string.IsNullOrEmpty(colName) ||
+                        string.Equals(colName, dropColumnName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    keepCols.Add(colName);
+                }
+            }
+
+            string tmpTable = tableName + "_rebuild_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            var createCols = new List<string>(keepCols.Count);
+            var copyCols = new List<string>(keepCols.Count);
+            foreach (string colName in keepCols)
+            {
+                if (string.Equals(colName, "rid", StringComparison.OrdinalIgnoreCase))
+                {
+                    createCols.Add("rid INTEGER PRIMARY KEY AUTOINCREMENT");
+                }
+                else
+                {
+                    createCols.Add(Sql.Ident(colName) + " TEXT");
+                }
+
+                copyCols.Add(Sql.Ident(colName));
+            }
+
+            if (createCols.Count == 0)
+            {
+                createCols.Add("rid INTEGER PRIMARY KEY AUTOINCREMENT");
+                copyCols.Add("rid");
+            }
+
+            string colList = string.Join(", ", copyCols);
+            _db.Execute("CREATE TABLE " + Sql.Ident(tmpTable) + " (" + string.Join(", ", createCols) + ")");
+            _db.Execute("INSERT INTO " + Sql.Ident(tmpTable) + " (" + colList + ") SELECT " + colList + " FROM " + Sql.Ident(tableName));
+            _db.Execute("DROP TABLE " + Sql.Ident(tableName));
+            _db.Execute("ALTER TABLE " + Sql.Ident(tmpTable) + " RENAME TO " + Sql.Ident(tableName));
         }
 
         /// <summary>把列配置写回数据库（设置窗口保存时调用）。</summary>
         public void UpdateColumn(AppColumn column)
         {
-            using (SqliteStatement st = _db.Prepare(
-                "UPDATE meta_column SET ordinal = ?, is_quick = ?, is_queried = ?, is_unique = ?, is_group = ?, is_sort = ?, is_url = ?, sort_desc = ?, sort_prio = ? WHERE id = ?"))
+            using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                st.Bind(1, (long)column.Ordinal);
-                st.Bind(2, column.IsQuick ? 1L : 0L);
-                st.Bind(3, column.IsQueried ? 1L : 0L);
-                st.Bind(4, column.IsUnique ? 1L : 0L);
-                st.Bind(5, column.IsGroup ? 1L : 0L);
-                st.Bind(6, column.IsSort ? 1L : 0L);
-                st.Bind(7, column.IsUrl ? 1L : 0L);
-                st.Bind(8, column.SortDescending ? 1L : 0L);
-                st.Bind(9, (long)column.SortPriority);
-                st.Bind(10, column.Id);
-                st.Step();
+                bool wasGroup = false;
+                long dbTableId = column.TableId;
+                using (SqliteStatement check = _db.Prepare("SELECT table_id, is_group FROM meta_column WHERE id = ?"))
+                {
+                    check.Bind(1, column.Id);
+                    if (check.Read())
+                    {
+                        if (dbTableId <= 0)
+                        {
+                            dbTableId = check.GetInt64(0);
+                        }
+
+                        wasGroup = check.GetInt64(1) != 0;
+                    }
+                }
+
+                using (SqliteStatement st = _db.Prepare(
+                    "UPDATE meta_column SET ordinal = ?, is_quick = ?, is_queried = ?, is_unique = ?, is_group = ?, is_sort = ?, is_url = ?, sort_desc = ?, sort_prio = ? WHERE id = ?"))
+                {
+                    st.Bind(1, (long)column.Ordinal);
+                    st.Bind(2, column.IsQuick ? 1L : 0L);
+                    st.Bind(3, column.IsQueried ? 1L : 0L);
+                    st.Bind(4, column.IsUnique ? 1L : 0L);
+                    st.Bind(5, column.IsGroup ? 1L : 0L);
+                    st.Bind(6, column.IsSort ? 1L : 0L);
+                    st.Bind(7, column.IsUrl ? 1L : 0L);
+                    st.Bind(8, column.SortDescending ? 1L : 0L);
+                    st.Bind(9, (long)column.SortPriority);
+                    st.Bind(10, column.Id);
+                    st.Step();
+                }
+
+                // 取消分组列标记时，清理该列挂在分组值上的标签绑定与孤儿标签
+                if (wasGroup && !column.IsGroup && dbTableId > 0)
+                {
+                    _db.Execute(
+                        "DELETE FROM meta_tag_link WHERE table_id = ? AND scope = 1 AND column_id = ?",
+                        dbTableId.ToString(CultureInfo.InvariantCulture),
+                        column.Id.ToString(CultureInfo.InvariantCulture));
+                    PurgeOrphanTags(dbTableId);
+                }
+
+                tx.Complete();
             }
         }
 
@@ -469,8 +681,12 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         public void DeleteTag(long tagId)
         {
             string tid = tagId.ToString(CultureInfo.InvariantCulture);
-            _db.Execute("DELETE FROM meta_tag_link WHERE tag_id = ?", tid);
-            _db.Execute("DELETE FROM meta_tag WHERE id = ?", tid);
+            using (SqliteConnection.Tx tx = _db.Transaction())
+            {
+                _db.Execute("DELETE FROM meta_tag_link WHERE tag_id = ?", tid);
+                _db.Execute("DELETE FROM meta_tag WHERE id = ?", tid);
+                tx.Complete();
+            }
         }
 
         /// <summary>给某一行绑定标签（scope = Row）。</summary>
@@ -499,19 +715,13 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         /// <summary>给某个分组值绑定标签（scope = GroupValue）。</summary>
         public void LinkTagToGroupValue(long tagId, long tableId, long columnId, string groupValue)
         {
-            bool exists = _db.Scalar(
-                "SELECT id FROM meta_tag_link WHERE tag_id = ? AND column_id = ? AND group_value = ? AND scope = 1",
-                tagId.ToString(CultureInfo.InvariantCulture),
-                columnId.ToString(CultureInfo.InvariantCulture),
-                groupValue) != null;
-
-            if (exists)
+            if (string.IsNullOrWhiteSpace(groupValue))
             {
                 return;
             }
 
             _db.Execute(
-                "INSERT INTO meta_tag_link (tag_id, table_id, scope, row_id, column_id, group_value) VALUES (?, ?, 1, 0, ?, ?)",
+                "INSERT OR IGNORE INTO meta_tag_link (tag_id, table_id, scope, row_id, column_id, group_value) VALUES (?, ?, 1, 0, ?, ?)",
                 tagId.ToString(CultureInfo.InvariantCulture),
                 tableId.ToString(CultureInfo.InvariantCulture),
                 columnId.ToString(CultureInfo.InvariantCulture),
@@ -527,64 +737,110 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
         /// <summary>行被删除时，删掉该行归属的标签绑定。</summary>
         public void RemoveRowLinks(long tableId, IEnumerable<long> rowIds)
         {
-            string tid = tableId.ToString(CultureInfo.InvariantCulture);
             using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                foreach (long rowId in rowIds)
+                using (SqliteStatement st = _db.Prepare(
+                    "DELETE FROM meta_tag_link WHERE table_id = ? AND scope = 0 AND row_id = ?"))
                 {
-                    _db.Execute(
-                        "DELETE FROM meta_tag_link WHERE table_id = ? AND scope = 0 AND row_id = ?",
-                        tid,
-                        rowId.ToString(CultureInfo.InvariantCulture));
+                    foreach (long rowId in rowIds)
+                    {
+                        st.Reset();
+                        st.Bind(1, tableId);
+                        st.Bind(2, rowId);
+                        st.Step();
+                    }
                 }
 
+                PurgeOrphanTags(tableId);
                 tx.Complete();
             }
-
-            PurgeOrphanTags(tableId);
         }
 
         /// <summary>
         /// 分组值被编辑后调用：旧值若已无任何数据引用，其标签一并删除。
         /// 只处理“该分组列”，不联动修改同组其他数据。
+        /// 单次扫描目标列构建 HashSet 比对，时间复杂度 O(N)。
         /// </summary>
         public void ReconcileGroupValue(long tableId, AppColumn groupColumn)
         {
-            // 找出该列上所有绑定了标签、但实际数据里已不存在的分组值
-            var stale = new List<long>();
-            string sql =
-                "SELECT l.id, l.group_value FROM meta_tag_link l WHERE l.table_id = ? AND l.scope = 1 AND l.column_id = ?";
-            using (SqliteStatement st = _db.Prepare(sql))
-            {
-                st.Bind(1, tableId);
-                st.Bind(2, groupColumn.Id);
-                while (st.Read())
-                {
-                    long linkId = st.GetInt64(0);
-                    string value = st.GetString(1);
-                    if (!GroupValueExists(tableId, groupColumn, value))
-                    {
-                        stale.Add(linkId);
-                    }
-                }
-            }
-
-            if (stale.Count == 0)
-            {
-                return;
-            }
-
             using (SqliteConnection.Tx tx = _db.Transaction())
             {
-                foreach (long linkId in stale)
+                var links = new List<KeyValuePair<long, string>>();
+                string linkSql =
+                    "SELECT id, group_value FROM meta_tag_link WHERE table_id = ? AND scope = 1 AND column_id = ?";
+                using (SqliteStatement st = _db.Prepare(linkSql))
                 {
-                    _db.Execute("DELETE FROM meta_tag_link WHERE id = ?", linkId.ToString(CultureInfo.InvariantCulture));
+                    st.Bind(1, tableId);
+                    st.Bind(2, groupColumn.Id);
+                    while (st.Read())
+                    {
+                        links.Add(new KeyValuePair<long, string>(st.GetInt64(0), st.GetString(1)));
+                    }
+                }
+
+                if (links.Count == 0)
+                {
+                    tx.Complete();
+                    return;
+                }
+
+                var existingValues = new HashSet<string>(StringComparer.Ordinal);
+                string colIdent = Sql.Ident(groupColumn.PhysicalName);
+                string colSql =
+                    "SELECT " + colIdent + " FROM " +
+                    Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture)) +
+                    " WHERE " + colIdent + " IS NOT NULL AND " + colIdent + " <> ''";
+
+                using (SqliteStatement st = _db.Prepare(colSql))
+                {
+                    while (st.Read())
+                    {
+                        string raw = st.GetString(0);
+                        if (string.IsNullOrEmpty(raw))
+                        {
+                            continue;
+                        }
+
+                        if (groupColumn.IsGroup)
+                        {
+                            foreach (string part in GroupValueSplitter.Split(raw))
+                            {
+                                existingValues.Add(part);
+                            }
+                        }
+                        else
+                        {
+                            existingValues.Add(raw);
+                        }
+                    }
+                }
+
+                var stale = new List<long>();
+                foreach (KeyValuePair<long, string> item in links)
+                {
+                    if (string.IsNullOrEmpty(item.Value) || !existingValues.Contains(item.Value))
+                    {
+                        stale.Add(item.Key);
+                    }
+                }
+
+                if (stale.Count > 0)
+                {
+                    using (SqliteStatement del = _db.Prepare("DELETE FROM meta_tag_link WHERE id = ?"))
+                    {
+                        foreach (long linkId in stale)
+                        {
+                            del.Reset();
+                            del.Bind(1, linkId);
+                            del.Step();
+                        }
+                    }
+
+                    PurgeOrphanTags(tableId);
                 }
 
                 tx.Complete();
             }
-
-            PurgeOrphanTags(tableId);
         }
 
         /// <summary>对整张表的所有分组列做一次孤儿分组值清理。</summary>
@@ -597,35 +853,6 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
                     ReconcileGroupValue(table.Id, c);
                 }
             }
-        }
-
-        private bool GroupValueExists(long tableId, AppColumn groupColumn, string value)
-        {
-            // 分组列：只要任一单元格按分隔符拆分后包含该值，即视为存在
-            if (groupColumn.IsGroup)
-            {
-                string sql = "SELECT " + Sql.Ident(groupColumn.PhysicalName) + " FROM " +
-                             Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture));
-                using (SqliteStatement st = _db.Prepare(sql))
-                {
-                    while (st.Read())
-                    {
-                        string raw = st.GetString(0) ?? string.Empty;
-                        if (GroupValueSplitter.Contains(raw, value))
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-
-            long count = _db.ScalarLong(
-                "SELECT COUNT(*) FROM " + Sql.Ident("t_" + tableId.ToString(CultureInfo.InvariantCulture)) +
-                " WHERE " + Sql.Ident(groupColumn.PhysicalName) + " = ?",
-                value);
-            return count > 0;
         }
 
         /// <summary>删除不再被任何绑定引用的标签。</summary>

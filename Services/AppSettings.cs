@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace DataManager.Services
 {
-    /// <summary>本地配置（config.json），按需求不加密存储。</summary>
+    /// <summary>本地配置（config.json）。WebDAV 密码在落盘时使用当前用户的 DPAPI 加密。</summary>
     public sealed class AppSettings
     {
         /// <summary>WebDAV 基地址。</summary>
@@ -14,7 +17,7 @@ namespace DataManager.Services
         /// <summary>WebDAV 账号。</summary>
         public string WebDavUser { get; set; } = string.Empty;
 
-        /// <summary>WebDAV 密码（按需求不加密）。</summary>
+        /// <summary>WebDAV 密码（内存中为明文，落盘时通过 DPAPI 透明加密）。</summary>
         public string WebDavPassword { get; set; } = string.Empty;
 
         /// <summary>WebDAV 上保存数据库的目录（相对基地址）；空表示直接用基地址。</summary>
@@ -75,6 +78,25 @@ namespace DataManager.Services
         /// <summary>主窗口高度。</summary>
         public double WindowHeight { get; set; } = 720;
 
+        /// <summary>归一化可能为 null 的字典集合，防止反序列化脏数据导致空引用。</summary>
+        internal void Normalize()
+        {
+            if (ColumnWidths == null)
+            {
+                ColumnWidths = new Dictionary<string, Dictionary<string, double>>();
+                return;
+            }
+
+            var keys = new List<string>(ColumnWidths.Keys);
+            foreach (string key in keys)
+            {
+                if (ColumnWidths[key] == null)
+                {
+                    ColumnWidths[key] = new Dictionary<string, double>();
+                }
+            }
+        }
+
         public AppSettings Clone()
         {
             var copy = new AppSettings
@@ -97,9 +119,14 @@ namespace DataManager.Services
                 WindowHeight = WindowHeight,
             };
 
-            foreach (KeyValuePair<string, Dictionary<string, double>> kv in ColumnWidths)
+            if (ColumnWidths != null)
             {
-                copy.ColumnWidths[kv.Key] = new Dictionary<string, double>(kv.Value);
+                foreach (KeyValuePair<string, Dictionary<string, double>> kv in ColumnWidths)
+                {
+                    copy.ColumnWidths[kv.Key] = kv.Value != null
+                        ? new Dictionary<string, double>(kv.Value)
+                        : new Dictionary<string, double>();
+                }
             }
 
             return copy;
@@ -160,8 +187,13 @@ namespace DataManager.Services
         /// <summary>记住某一列的宽度比例（0~1，占表格总宽度）。</summary>
         public void SetColumnWidth(long tableId, string physicalName, double width)
         {
+            if (ColumnWidths == null)
+            {
+                ColumnWidths = new Dictionary<string, Dictionary<string, double>>();
+            }
+
             string key = tableId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            if (!ColumnWidths.TryGetValue(key, out Dictionary<string, double> map))
+            if (!ColumnWidths.TryGetValue(key, out Dictionary<string, double> map) || map == null)
             {
                 map = new Dictionary<string, double>();
                 ColumnWidths[key] = map;
@@ -173,8 +205,14 @@ namespace DataManager.Services
         /// <summary>取某列记住的宽度比例（0~1）；没有则返回 0。</summary>
         public double GetColumnWidth(long tableId, string physicalName)
         {
+            if (ColumnWidths == null)
+            {
+                return 0;
+            }
+
             string key = tableId.ToString(System.Globalization.CultureInfo.InvariantCulture);
             if (ColumnWidths.TryGetValue(key, out Dictionary<string, double> map) &&
+                map != null &&
                 map.TryGetValue(physicalName, out double width))
             {
                 return width;
@@ -189,16 +227,21 @@ namespace DataManager.Services
     {
         /// <summary>
         /// 实际生效的分隔符：把配置里的符号（默认“/”）前后各补一个空格。
-        /// 配置为 null 时按默认“/”处理；配置为“”或纯空白时不拆分。
+        /// 配置为 null 时按默认“ / ”处理；配置为“”或纯空白时不拆分（返回空串）。
         /// </summary>
         public static string Separator
         {
             get
             {
                 string s = App.Settings?.GroupSeparator;
+                if (s == null)
+                {
+                    return " / ";
+                }
+
                 if (string.IsNullOrWhiteSpace(s))
                 {
-                    return s ?? string.Empty;
+                    return string.Empty;
                 }
 
                 return " " + s.Trim() + " ";
@@ -275,23 +318,26 @@ namespace DataManager.Services
         {
             try
             {
-                if (System.IO.File.Exists(AppPaths.SettingsFile))
+                if (File.Exists(AppPaths.SettingsFile))
                 {
-                    string json = System.IO.File.ReadAllText(AppPaths.SettingsFile);
+                    string json = File.ReadAllText(AppPaths.SettingsFile);
                     if (!string.IsNullOrWhiteSpace(json))
                     {
                         AppSettings s = JsonSerializer.Deserialize<AppSettings>(json, Options);
                         if (s != null)
                         {
+                            s.Normalize();
                             s.MigrateLegacy();
+                            s.WebDavPassword = DpapiHelper.Unprotect(s.WebDavPassword);
                             return s;
                         }
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // 配置损坏时回退到默认值，不阻断启动
+                AppLog.Error("读取配置文件失败，将备份为 config.json.bak 并回退默认配置。", ex);
+                TryBackupCorruptConfig();
             }
 
             return new AppSettings();
@@ -299,9 +345,226 @@ namespace DataManager.Services
 
         public static void Save(AppSettings settings)
         {
+            if (settings == null)
+            {
+                throw new ArgumentNullException(nameof(settings));
+            }
+
             AppPaths.EnsureCreated();
-            string json = JsonSerializer.Serialize(settings, Options);
-            System.IO.File.WriteAllText(AppPaths.SettingsFile, json, new System.Text.UTF8Encoding(false));
+
+            // 克隆副本并加密密码，避免污染内存中的明文配置
+            AppSettings toSave = settings.Clone();
+            toSave.Normalize();
+            toSave.WebDavPassword = DpapiHelper.Protect(toSave.WebDavPassword);
+
+            string json = JsonSerializer.Serialize(toSave, Options);
+            string tmpPath = AppPaths.SettingsFile + ".tmp";
+            bool moved = false;
+            try
+            {
+                File.WriteAllText(tmpPath, json, new UTF8Encoding(false));
+                File.Move(tmpPath, AppPaths.SettingsFile, true);
+                moved = true;
+            }
+            finally
+            {
+                if (!moved)
+                {
+                    try
+                    {
+                        if (File.Exists(tmpPath))
+                        {
+                            File.Delete(tmpPath);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            }
+        }
+
+        private static void TryBackupCorruptConfig()
+        {
+            try
+            {
+                if (File.Exists(AppPaths.SettingsFile))
+                {
+                    File.Copy(AppPaths.SettingsFile, AppPaths.SettingsFile + ".bak", true);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("备份损坏的配置文件失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>通过 P/Invoke 调用 Windows DPAPI（crypt32.dll）实现零依赖加密。</summary>
+        private static class DpapiHelper
+        {
+            private const string Prefix = "dpapi:";
+            private const int CRYPTPROTECT_UI_FORBIDDEN = 0x1;
+
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+            private struct DATA_BLOB
+            {
+                public int cbData;
+                public IntPtr pbData;
+            }
+
+            [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            private static extern bool CryptProtectData(
+                ref DATA_BLOB pDataIn,
+                string szDataDescr,
+                IntPtr pOptionalEntropy,
+                IntPtr pvReserved,
+                IntPtr pPromptStruct,
+                int dwFlags,
+                out DATA_BLOB pDataOut);
+
+            [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+            private static extern bool CryptUnprotectData(
+                ref DATA_BLOB pDataIn,
+                IntPtr ppszDataDescr,
+                IntPtr pOptionalEntropy,
+                IntPtr pvReserved,
+                IntPtr pPromptStruct,
+                int dwFlags,
+                out DATA_BLOB pDataOut);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            private static extern IntPtr LocalFree(IntPtr hMem);
+
+            public static string Protect(string plainText)
+            {
+                if (string.IsNullOrEmpty(plainText))
+                {
+                    return string.Empty;
+                }
+
+                if (plainText.StartsWith(Prefix, StringComparison.Ordinal))
+                {
+                    return plainText;
+                }
+
+                byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
+                var inBlob = new DATA_BLOB();
+                var outBlob = new DATA_BLOB();
+                try
+                {
+                    inBlob.cbData = plainBytes.Length;
+                    inBlob.pbData = Marshal.AllocHGlobal(plainBytes.Length);
+                    Marshal.Copy(plainBytes, 0, inBlob.pbData, plainBytes.Length);
+
+                    if (!CryptProtectData(
+                        ref inBlob,
+                        null,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        out outBlob))
+                    {
+                        AppLog.Warn("DPAPI 加密 WebDAV 密码失败，Win32 错误码：" + Marshal.GetLastWin32Error());
+                        return plainText;
+                    }
+
+                    byte[] cipherBytes = new byte[outBlob.cbData];
+                    Marshal.Copy(outBlob.pbData, cipherBytes, 0, outBlob.cbData);
+                    return Prefix + Convert.ToBase64String(cipherBytes);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("DPAPI 加密 WebDAV 密码异常。", ex);
+                    return plainText;
+                }
+                finally
+                {
+                    if (inBlob.pbData != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(inBlob.pbData);
+                    }
+
+                    if (outBlob.pbData != IntPtr.Zero)
+                    {
+                        LocalFree(outBlob.pbData);
+                    }
+                }
+            }
+
+            public static string Unprotect(string stored)
+            {
+                if (string.IsNullOrEmpty(stored))
+                {
+                    return string.Empty;
+                }
+
+                // 自动兼容旧版明文配置
+                if (!stored.StartsWith(Prefix, StringComparison.Ordinal))
+                {
+                    return stored;
+                }
+
+                string base64 = stored.Substring(Prefix.Length);
+                if (string.IsNullOrEmpty(base64))
+                {
+                    return string.Empty;
+                }
+
+                byte[] cipherBytes;
+                try
+                {
+                    cipherBytes = Convert.FromBase64String(base64);
+                }
+                catch (FormatException ex)
+                {
+                    AppLog.Error("DPAPI 密文格式无效。", ex);
+                    return string.Empty;
+                }
+
+                var inBlob = new DATA_BLOB();
+                var outBlob = new DATA_BLOB();
+                try
+                {
+                    inBlob.cbData = cipherBytes.Length;
+                    inBlob.pbData = Marshal.AllocHGlobal(cipherBytes.Length);
+                    Marshal.Copy(cipherBytes, 0, inBlob.pbData, cipherBytes.Length);
+
+                    if (!CryptUnprotectData(
+                        ref inBlob,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        out outBlob))
+                    {
+                        AppLog.Warn("DPAPI 解密 WebDAV 密码失败，Win32 错误码：" + Marshal.GetLastWin32Error());
+                        return string.Empty;
+                    }
+
+                    byte[] plainBytes = new byte[outBlob.cbData];
+                    Marshal.Copy(outBlob.pbData, plainBytes, 0, outBlob.cbData);
+                    return Encoding.UTF8.GetString(plainBytes);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("DPAPI 解密 WebDAV 密码异常。", ex);
+                    return string.Empty;
+                }
+                finally
+                {
+                    if (inBlob.pbData != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(inBlob.pbData);
+                    }
+
+                    if (outBlob.pbData != IntPtr.Zero)
+                    {
+                        LocalFree(outBlob.pbData);
+                    }
+                }
+            }
         }
     }
 }

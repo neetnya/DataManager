@@ -28,13 +28,13 @@ namespace DataManager
         public string TimeText => Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
     }
 
-    /// <summary>进度回调：把字节数折算成百分比。</summary>
-    internal sealed class PercentProgress : IProgress<long>, IDisposable
+    /// <summary>进度回调：同时传递已传输字节数与总大小（总大小 <= 0 表示未知大小）。</summary>
+    internal sealed class TransferProgress : IProgress<long>, IDisposable
     {
-        private readonly Action<double> _report;
+        private readonly Action<long, long> _report;
         private readonly long _total;
 
-        public PercentProgress(long total, Action<double> report)
+        public TransferProgress(long total, Action<long, long> report)
         {
             _total = total;
             _report = report;
@@ -42,14 +42,7 @@ namespace DataManager
 
         public void Report(long value)
         {
-            if (_total <= 0)
-            {
-                _report(0);
-                return;
-            }
-
-            double percent = Math.Min(100.0, value * 100.0 / _total);
-            _report(percent);
+            _report(value, _total);
         }
 
         public void Dispose()
@@ -62,6 +55,8 @@ namespace DataManager
     {
         private CancellationTokenSource _cts;
         private bool _busy;
+        private bool _isClosed;
+        private string _httpWarnedUrl;
 
         public BackupWindow()
         {
@@ -87,6 +82,11 @@ namespace DataManager
 
         private void RefreshBackups()
         {
+            if (_isClosed || !IsLoaded)
+            {
+                return;
+            }
+
             var rows = new List<BackupRow>();
             foreach (FileInfo f in BackupService.ListLocalBackups())
             {
@@ -100,7 +100,9 @@ namespace DataManager
             }
 
             BackupGrid.ItemsSource = rows;
-            BtnDeleteBackup.IsEnabled = rows.Count > 0;
+            bool hasRows = rows.Count > 0;
+            BtnDeleteLocal.IsEnabled = !_busy && hasRows;
+            BtnRestoreLocal.IsEnabled = !_busy && hasRows;
             TxtLocalStatus.Text = rows.Count == 0
                 ? "还没有本地备份。"
                 : "共 " + rows.Count.ToString(CultureInfo.InvariantCulture) + " 个本地备份，位于：" + AppPaths.BackupDirectory;
@@ -113,18 +115,26 @@ namespace DataManager
 
         private void OnLocalBackup(object sender, RoutedEventArgs e)
         {
-            try
+            int keepCount = App.Settings.BackupKeepCount;
+            string createdPath = null;
+
+            RunBusy("正在创建本地备份…", ct =>
             {
-                string path = BackupService.CreateLocalBackup(Data.Connection, "manual");
-                BackupService.PruneLocalBackups(App.Settings.BackupKeepCount);
+                ct.ThrowIfCancellationRequested();
+                createdPath = BackupService.CreateLocalBackup(Data.Connection, "manual");
+                BackupService.PruneLocalBackups(keepCount);
+                return "本地备份已完成：" + Path.GetFileName(createdPath);
+            }, afterSuccess: () =>
+            {
+                if (_isClosed || !IsLoaded)
+                {
+                    return;
+                }
+
                 RefreshBackups();
-                MessageWindow.Show(this, "本地备份已完成：\n" + path,
-                "本地备份", Dialogs.MessageTone.Info);
-            }
-            catch (Exception ex)
-            {
-                MessageWindow.Show(this, "本地备份失败：\n\n" + ex.Message, "本地备份", Dialogs.MessageTone.Danger);
-            }
+                MessageWindow.Show(this, "本地备份已完成：\n" + createdPath,
+                    "本地备份", MessageTone.Info);
+            });
         }
 
         private void OnOpenBackupFolder(object sender, RoutedEventArgs e)
@@ -140,7 +150,7 @@ namespace DataManager
             }
             catch (Exception ex)
             {
-                MessageWindow.Show(this, "无法打开备份文件夹：\n\n" + ex.Message, "打开文件夹", Dialogs.MessageTone.Danger);
+                MessageWindow.Show(this, "无法打开备份文件夹：\n\n" + ex.Message, "打开文件夹", MessageTone.Danger);
             }
         }
 
@@ -148,11 +158,11 @@ namespace DataManager
         {
             if (!(BackupGrid.SelectedItem is BackupRow row))
             {
-
+                MessageWindow.Show(this, "请先在列表里选择一个本地备份文件。", "删除备份", MessageTone.Info);
                 return;
             }
 
-            if (!MessageWindow.Confirm(this, "确定要删除备份文件「" + row.FileName + "」吗？", "删除备份", Dialogs.MessageTone.Danger, Dialogs.MessageButtons.OkCancel))
+            if (!MessageWindow.Confirm(this, "确定要删除备份文件「" + row.FileName + "」吗？", "删除备份", MessageTone.Danger, MessageButtons.OkCancel))
             {
                 return;
             }
@@ -164,7 +174,7 @@ namespace DataManager
             }
             catch (Exception ex)
             {
-                MessageWindow.Show(this, "删除失败：\n\n" + ex.Message, "删除备份", Dialogs.MessageTone.Danger);
+                MessageWindow.Show(this, "删除失败：\n\n" + ex.Message, "删除备份", MessageTone.Danger);
             }
         }
 
@@ -172,7 +182,7 @@ namespace DataManager
         {
             if (!int.TryParse(TxtKeepCount.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int keep) || keep < 0)
             {
-                MessageWindow.Show(this, "请输入 0 或正整数（0 表示保留全部）。", "保留策略", Dialogs.MessageTone.Info);
+                MessageWindow.Show(this, "请输入 0 或正整数（0 表示保留全部）。", "保留策略", MessageTone.Info);
                 return;
             }
 
@@ -184,14 +194,25 @@ namespace DataManager
             MessageWindow.Show(this, keep == 0
                     ? "已设为保留全部本地备份。"
                     : "保留最近 " + keep.ToString(CultureInfo.InvariantCulture) + " 份，已清理 " + removed.ToString(CultureInfo.InvariantCulture) + " 个旧备份。",
-                "保留策略", Dialogs.MessageTone.Info);
+                "保留策略", MessageTone.Info);
         }
 
         private void OnRestoreLocal(object sender, RoutedEventArgs e)
         {
             if (!(BackupGrid.SelectedItem is BackupRow row))
             {
+                MessageWindow.Show(this, "请先在列表里选择一个本地备份文件。", "恢复本地备份", MessageTone.Info);
+                return;
+            }
 
+            if (!MessageWindow.Confirm(
+                this,
+                "将用本地备份「" + row.FileName + "」覆盖当前数据库。\n\n" +
+                "恢复前会自动在本地备份当前数据库，恢复后需要重启软件。\n\n确定继续吗？",
+                "恢复本地备份",
+                MessageTone.Danger,
+                MessageButtons.OkCancel))
+            {
                 return;
             }
 
@@ -202,10 +223,45 @@ namespace DataManager
         // WebDAV
         // =================================================================
 
+        /// <summary>若配置了明文 http:// 地址，弹出安全确认提示；返回 false 表示用户取消。</summary>
+        private bool ConfirmHttpSecurityIfNeeded(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url) ||
+                !url.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (string.Equals(_httpWarnedUrl, url, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            bool ok = MessageWindow.Confirm(
+                this,
+                "当前 WebDAV 地址使用明文 HTTP 协议（http://），账号密码及数据库内容在网络传输过程中可能被窃听。\n\n" +
+                "建议优先使用 HTTPS（https://）地址。仍要继续使用该明文地址吗？",
+                "安全提示",
+                MessageTone.Warning,
+                MessageButtons.OkCancel);
+
+            if (ok)
+            {
+                _httpWarnedUrl = url;
+            }
+
+            return ok;
+        }
+
         private void OnSaveDavConfig(object sender, RoutedEventArgs e)
         {
             DavConfig config = ReadConfigFromUi();
             if (config == null)
+            {
+                return;
+            }
+
+            if (!ConfirmHttpSecurityIfNeeded(config.Url))
             {
                 return;
             }
@@ -219,31 +275,30 @@ namespace DataManager
             }
             catch (Exception ex)
             {
-                MessageWindow.Show(this, "保存配置失败：\n\n" + ex.Message, "保存配置", Dialogs.MessageTone.Danger);
+                MessageWindow.Show(this, "保存配置失败：\n\n" + ex.Message, "保存配置", MessageTone.Danger);
             }
         }
 
         private void OnTestConnection(object sender, RoutedEventArgs e)
         {
-            // 所有界面取值都必须在 UI 线程上完成，后台线程碰控件会抛
-            // “调用线程无法访问此对象，因为另一个线程拥有该对象”。
+            // 所有界面取值都必须在 UI 线程上完成，后台线程碰控件会抛跨线程访问异常。
             DavConfig config = CaptureConfig();
             if (config == null)
             {
                 return;
             }
 
-            RunBusy("正在测试连接…", () =>
+            RunBusy("正在测试连接…", ct =>
             {
                 using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
                 {
-                    client.TestConnection();
+                    client.TestConnection(ct);
 
                     // 连接能通不代表目录存在：PUT 不会自动建目录，这里顺便看一眼，
                     // 免得用户点“上传”时才撞上 404。
                     if (config.Directory.Length > 0)
                     {
-                        bool exists = client.DirectoryExists(config.Directory);
+                        bool exists = client.DirectoryExists(config.Directory, ct);
                         return exists
                             ? "连接成功，目录「" + config.Directory + "」已存在"
                             : "连接成功，但目录「" + config.Directory + "」还不存在（上传时会自动创建）";
@@ -273,6 +328,7 @@ namespace DataManager
         private DavConfig ReadConfigFromUi()
         {
             string prefix = (TxtRemoteName.Text ?? string.Empty).Trim();
+            string safePrefix = BackupService.SafeFileName(prefix);
 
             return new DavConfig
             {
@@ -280,7 +336,7 @@ namespace DataManager
                 User = (TxtUser.Text ?? string.Empty).Trim(),
                 Password = TxtPassword.Password ?? string.Empty,
                 Directory = (TxtRemoteDir.Text ?? string.Empty).Trim(),
-                NamePrefix = prefix.Length == 0 ? "DataManager" : BackupService.SafeFileName(prefix),
+                NamePrefix = string.IsNullOrEmpty(safePrefix) ? "DataManager" : safePrefix,
             };
         }
 
@@ -294,7 +350,7 @@ namespace DataManager
             App.Settings.WebDavFileNamePrefix = config.NamePrefix;
         }
 
-        /// <summary>在 UI 线程读取并保存 WebDAV 配置；地址为空时返回 null。</summary>
+        /// <summary>在 UI 线程读取、校验并保存 WebDAV 配置；地址为空或取消明文 HTTP 警告时返回 null。</summary>
         private DavConfig CaptureConfig()
         {
             DavConfig config = ReadConfigFromUi();
@@ -302,6 +358,11 @@ namespace DataManager
             if (config.Url.Length == 0)
             {
                 MessageWindow.Show(this, "请先填写 WebDAV 地址。", "WebDAV", MessageTone.Info);
+                return null;
+            }
+
+            if (!ConfirmHttpSecurityIfNeeded(config.Url))
+            {
                 return null;
             }
 
@@ -330,52 +391,57 @@ namespace DataManager
             // 每次上传都生成新文件名：不依赖服务器的 PUT 覆盖语义，历史备份也自动保留。
             string remoteFileName = BackupService.RemoteBackupFileName(config.NamePrefix);
 
-            RunBusy("正在上传…", () =>
+            RunBusy("正在上传…", ct =>
             {
                 // 先把当前库在线备份成一个一致快照，再上传这个快照
                 string snapshot = Path.Combine(AppPaths.RestoreStageDirectory, "upload_snapshot.sqlite");
                 Directory.CreateDirectory(AppPaths.RestoreStageDirectory);
-                if (File.Exists(snapshot))
-                {
-                    File.Delete(snapshot);
-                }
-
-                Data.Connection.BackupTo(snapshot);
-                long total = new FileInfo(snapshot).Length;
-
-                using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
-                using (var progress = new PercentProgress(total, ReportProgress))
-                {
-                    // PUT 不会自动建目录，先把远端目录补齐（已存在则跳过）
-                    client.EnsureDirectory(config.Directory, _cts.Token);
-                    client.Upload(snapshot, config.FullRemotePath(remoteFileName), progress, _cts.Token);
-                }
 
                 try
                 {
-                    File.Delete(snapshot);
-                }
-                catch (Exception)
-                {
-                    // 清理快照失败无碍
-                }
+                    TryDeleteFileQuietly(snapshot);
 
-                return "上传完成：" + remoteFileName + "（" + BackupService.FormatSize(total) + "）";
+                    ct.ThrowIfCancellationRequested();
+                    Data.Connection.BackupTo(snapshot);
+                    long total = new FileInfo(snapshot).Length;
+
+                    using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
+                    using (var progress = new TransferProgress(total, ReportProgress))
+                    {
+                        // PUT 不会自动建目录，先把远端目录补齐（已存在则跳过）
+                        client.EnsureDirectory(config.Directory, ct);
+                        client.Upload(snapshot, config.FullRemotePath(remoteFileName), progress, ct);
+                    }
+
+                    return "上传完成：" + remoteFileName + "（" + BackupService.FormatSize(total) + "）";
+                }
+                finally
+                {
+                    TryDeleteFileQuietly(snapshot);
+                }
             }, afterSuccess: () =>
             {
+                if (_isClosed || !IsLoaded)
+                {
+                    return;
+                }
+
                 // 上传完顺手刷新远端列表，让用户立刻看到新备份
                 RefreshRemoteList(config, showStatus: true);
             });
         }
 
         // =================================================================
-        // 远端备份列表 / 恢复
+        // 远端备份列表 / 恢复 / 删除
         // =================================================================
 
         /// <summary>远端备份文件的展示行。</summary>
         public sealed class RemoteBackupRow
         {
             public string FileName { get; set; }
+
+            /// <summary>刷新列表时固定写入的远端相对路径，恢复与删除时直接使用。</summary>
+            public string RemotePath { get; set; }
 
             public long Length { get; set; }
 
@@ -402,13 +468,20 @@ namespace DataManager
         /// <summary>拉取远端备份列表并展示；失败只提示，不打断界面。</summary>
         private void RefreshRemoteList(DavConfig config, bool showStatus)
         {
-            RunBusy("正在读取远端备份列表…", () =>
+            if (_isClosed || !IsLoaded)
+            {
+                return;
+            }
+
+            List<RemoteBackupRow> fetchedRows = null;
+
+            RunBusy("正在读取远端备份列表…", ct =>
             {
                 var rows = new List<RemoteBackupRow>();
 
                 using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
                 {
-                    foreach (WebDavEntry entry in client.List(config.Directory))
+                    foreach (WebDavEntry entry in client.List(config.Directory, ct))
                     {
                         if (entry.IsCollection)
                         {
@@ -423,6 +496,7 @@ namespace DataManager
                         rows.Add(new RemoteBackupRow
                         {
                             FileName = entry.Name,
+                            RemotePath = config.FullRemotePath(entry.Name),
                             Length = entry.Length,
                             Time = entry.LastModified.HasValue
                                 ? entry.LastModified.Value.ToLocalTime()
@@ -433,21 +507,27 @@ namespace DataManager
 
                 // 新的排前面
                 rows.Sort((a, b) => b.Time.CompareTo(a.Time));
-
-                Dispatcher.Invoke(() =>
-                {
-                    RemoteGrid.ItemsSource = rows;
-                    BtnRestoreRemote.IsEnabled = rows.Count > 0;
-
-                    if (showStatus)
-                    {
-                        TxtRemoteStatus.Text = rows.Count == 0
-                            ? "远端还没有备份文件。"
-                            : "共 " + rows.Count.ToString(CultureInfo.InvariantCulture) + " 个远端备份。";
-                    }
-                });
+                fetchedRows = rows;
 
                 return null;
+            }, afterSuccess: () =>
+            {
+                if (_isClosed || !IsLoaded || fetchedRows == null)
+                {
+                    return;
+                }
+
+                RemoteGrid.ItemsSource = fetchedRows;
+                bool hasRows = fetchedRows.Count > 0;
+                BtnRestoreRemote.IsEnabled = !_busy && hasRows;
+                BtnDeleteRemote.IsEnabled = !_busy && hasRows;
+
+                if (showStatus)
+                {
+                    TxtRemoteStatus.Text = fetchedRows.Count == 0
+                        ? "远端还没有备份文件。"
+                        : "共 " + fetchedRows.Count.ToString(CultureInfo.InvariantCulture) + " 个远端备份。";
+                }
             }, quiet: true);
         }
 
@@ -465,7 +545,9 @@ namespace DataManager
                 return;
             }
 
-            string remotePath = WebDavClient.CombineRemotePath(config.Directory, row.FileName);
+            string remotePath = string.IsNullOrWhiteSpace(row.RemotePath)
+                ? WebDavClient.CombineRemotePath(config.Directory, row.FileName)
+                : row.RemotePath;
 
             if (!MessageWindow.Confirm(this, "将用 WebDAV 上的「" + remotePath + "」覆盖当前数据库。\n\n" +
                 "恢复前会自动在本地备份当前数据库，恢复后需要重启软件。\n\n确定继续吗？",
@@ -474,30 +556,91 @@ namespace DataManager
                 return;
             }
 
-            RunBusy("正在下载…", () =>
+            string downloaded = Path.Combine(AppPaths.RestoreStageDirectory, "downloaded.sqlite");
+
+            RunBusy("正在下载…", ct =>
             {
                 Directory.CreateDirectory(AppPaths.RestoreStageDirectory);
-                string downloaded = Path.Combine(AppPaths.RestoreStageDirectory, "downloaded.sqlite");
-                if (File.Exists(downloaded))
-                {
-                    File.Delete(downloaded);
-                }
+                TryDeleteFileQuietly(downloaded);
 
                 long total;
                 using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
                 {
-                    total = client.GetContentLength(remotePath);
-                    using (var progress = new PercentProgress(total, ReportProgress))
+                    total = client.GetContentLength(remotePath, ct);
+                    if (total <= 0)
                     {
-                        client.Download(remotePath, downloaded, progress, _cts.Token);
+                        ReportProgress(0, total);
+                    }
+
+                    using (var progress = new TransferProgress(total, ReportProgress))
+                    {
+                        client.Download(remotePath, downloaded, progress, ct);
                     }
                 }
 
                 return "下载完成：" + BackupService.FormatSize(new FileInfo(downloaded).Length);
             }, afterSuccess: () =>
             {
-                string downloaded = Path.Combine(AppPaths.RestoreStageDirectory, "downloaded.sqlite");
-                ConfirmAndRestore(downloaded, "WebDAV 上的「" + remotePath + "」");
+                try
+                {
+                    if (_isClosed || !IsLoaded)
+                    {
+                        return;
+                    }
+
+                    ConfirmAndRestore(downloaded, "WebDAV 上的「" + remotePath + "」");
+                }
+                finally
+                {
+                    TryDeleteFileQuietly(downloaded);
+                }
+            });
+        }
+
+        private void OnDeleteRemote(object sender, RoutedEventArgs e)
+        {
+            DavConfig config = CaptureConfig();
+            if (config == null)
+            {
+                return;
+            }
+
+            if (!(RemoteGrid.SelectedItem is RemoteBackupRow row))
+            {
+                MessageWindow.Show(this, "请先在列表里选择一个远端备份文件。", "删除远端备份", MessageTone.Info);
+                return;
+            }
+
+            string remotePath = string.IsNullOrWhiteSpace(row.RemotePath)
+                ? WebDavClient.CombineRemotePath(config.Directory, row.FileName)
+                : row.RemotePath;
+
+            if (!MessageWindow.Confirm(
+                this,
+                "确定要永久删除 WebDAV 上的远端备份「" + remotePath + "」吗？",
+                "删除远端备份",
+                MessageTone.Danger,
+                MessageButtons.OkCancel))
+            {
+                return;
+            }
+
+            RunBusy("正在删除远端备份…", ct =>
+            {
+                using (WebDavClient client = new WebDavClient(config.Url, config.User, config.Password))
+                {
+                    client.Delete(remotePath, ct);
+                }
+
+                return "已删除远端备份：" + row.FileName;
+            }, afterSuccess: () =>
+            {
+                if (_isClosed || !IsLoaded)
+                {
+                    return;
+                }
+
+                RefreshRemoteList(config, showStatus: true);
             });
         }
 
@@ -508,11 +651,16 @@ namespace DataManager
         /// <summary>校验来源文件 → 备份当前库 → 关闭连接 → 覆盖 → 提示重启。</summary>
         private void ConfirmAndRestore(string sourcePath, string description)
         {
+            if (_isClosed || !IsLoaded)
+            {
+                return;
+            }
+
             string reason;
             if (!BackupService.IsValidSqlite(sourcePath, out reason))
             {
                 MessageWindow.Show(this, "无法用该文件恢复：\n\n" + reason,
-                    "恢复失败", Dialogs.MessageTone.Danger);
+                    "恢复失败", MessageTone.Danger);
                 return;
             }
 
@@ -525,7 +673,7 @@ namespace DataManager
             catch (Exception ex)
             {
                 if (!MessageWindow.Confirm(this, "恢复前的自动备份失败：\n\n" + ex.Message + "\n\n仍要继续恢复吗？",
-                        "恢复", Dialogs.MessageTone.Danger, Dialogs.MessageButtons.OkCancel))
+                        "恢复", MessageTone.Danger, MessageButtons.OkCancel))
                 {
                     return;
                 }
@@ -541,35 +689,60 @@ namespace DataManager
             }
             catch (Exception ex)
             {
+                bool rolledBack = false;
+
+                // 若主库已被覆盖但伴随文件清理失败，优先回滚恢复前备份，避免直接以不一致状态重开主库
+                if (ex is DatabaseSidecarCleanupException &&
+                    currentBackup != null &&
+                    File.Exists(currentBackup))
+                {
+                    try
+                    {
+                        BackupService.ReplaceDatabase(currentBackup);
+                        rolledBack = true;
+                    }
+                    catch (Exception rollbackEx)
+                    {
+                        App.ExitAction = AppExitAction.Shutdown;
+                        MessageWindow.Show(this, "恢复失败：\n\n" + ex.Message + "\n\n" +
+                            "尝试回滚恢复前备份也失败：" + rollbackEx.Message + "\n\n" +
+                            "恢复前的备份仍在：" + currentBackup + "\n\n" +
+                            "软件将关闭，请手动检查后重新打开。",
+                            "恢复失败", MessageTone.Danger);
+                        this.CloseWithResult(true);
+                        return;
+                    }
+                }
+
                 try
                 {
                     Data.ReopenDatabase();
                 }
                 catch (Exception reopenEx)
                 {
-                    App.RestartRequested = true;
+                    App.ExitAction = AppExitAction.Shutdown;
                     MessageWindow.Show(this, "恢复失败：\n\n" + ex.Message + "\n\n" +
                         "当前数据库也无法重新打开：" + reopenEx.Message + "\n\n" +
                         (currentBackup != null ? "恢复前的备份仍在：" + currentBackup + "\n\n" : string.Empty) +
                         "软件将关闭，请重新打开后再试。",
-                        "恢复失败", Dialogs.MessageTone.Danger);
+                        "恢复失败", MessageTone.Danger);
                     this.CloseWithResult(true);
                     return;
                 }
 
                 MessageWindow.Show(this, "恢复失败：\n\n" + ex.Message + "\n\n" +
-                    "已重新打开原来的数据库。" +
+                    (rolledBack ? "已回滚并重新打开恢复前的数据库。" : "已重新打开原来的数据库。") +
                     (currentBackup != null ? "\n恢复前的备份仍在：" + currentBackup : string.Empty),
-                    "恢复失败", Dialogs.MessageTone.Danger);
+                    "恢复失败", MessageTone.Danger);
                 return;
             }
 
-            App.RestartRequested = true;
+            App.ExitAction = AppExitAction.Restart;
 
             MessageWindow.Show(this, "恢复完成。\n\n来源：" + description + "\n" +
                 (currentBackup != null ? "恢复前的数据库已备份到：\n" + currentBackup + "\n\n" : string.Empty) +
                 "软件将立即重启以重新打开数据库。",
-                "恢复完成", Dialogs.MessageTone.Info);
+                "恢复完成", MessageTone.Info);
 
             this.CloseWithResult(true);
         }
@@ -578,13 +751,32 @@ namespace DataManager
         // 忙碌状态
         // =================================================================
 
-        private void ReportProgress(double percent)
+        private void ReportProgress(long transferred, long total)
         {
-            Dispatcher.Invoke(() =>
+            if (_isClosed)
             {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (_isClosed || !IsLoaded)
+                {
+                    return;
+                }
+
                 OpProgress.Visibility = Visibility.Visible;
-                OpProgress.Value = percent;
-            });
+                if (total <= 0)
+                {
+                    OpProgress.IsIndeterminate = true;
+                    TxtDavStatus.Text = "正在下载… 已下载 " + BackupService.FormatSize(transferred);
+                }
+                else
+                {
+                    OpProgress.IsIndeterminate = false;
+                    OpProgress.Value = Math.Min(100.0, transferred * 100.0 / total);
+                }
+            }));
         }
 
         private void SetBusy(bool busy, string status)
@@ -594,6 +786,7 @@ namespace DataManager
             OpProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
             if (!busy)
             {
+                OpProgress.IsIndeterminate = false;
                 OpProgress.Value = 0;
             }
 
@@ -604,63 +797,135 @@ namespace DataManager
                 TxtDavStatus.Text = status;
             }
 
+            // 本地备份区读写按钮与输入控件
+            BtnLocalBackup.IsEnabled = !busy;
+            BtnRefreshBackups.IsEnabled = !busy;
+            BtnRestoreLocal.IsEnabled = !busy && BackupGrid.Items.Count > 0;
+            BtnDeleteLocal.IsEnabled = !busy && BackupGrid.Items.Count > 0;
+            TxtKeepCount.IsEnabled = !busy;
+            BtnApplyKeep.IsEnabled = !busy;
+
+            // WebDAV 区配置、网络读写按钮与输入控件
             TxtUrl.IsEnabled = !busy;
             TxtUser.IsEnabled = !busy;
             TxtPassword.IsEnabled = !busy;
             TxtRemoteDir.IsEnabled = !busy;
             TxtRemoteName.IsEnabled = !busy;
+            BtnSaveConfig.IsEnabled = !busy;
+            BtnTestConn.IsEnabled = !busy;
+            BtnUpload.IsEnabled = !busy;
             BtnListRemote.IsEnabled = !busy;
             BtnRestoreRemote.IsEnabled = !busy && RemoteGrid.Items.Count > 0;
+            BtnDeleteRemote.IsEnabled = !busy && RemoteGrid.Items.Count > 0;
         }
 
         /// <summary>
-        /// 在后台线程执行一个网络操作，界面显示进度与状态。
+        /// 在后台线程执行一个耗时/网络操作，界面显示进度与状态。
         /// quiet = true 时不动 TxtDavStatus，用于不打断主操作结果的附带刷新。
         /// </summary>
-        private void RunBusy(string initialStatus, Func<string> operation, Action afterSuccess = null, bool quiet = false)
+        private void RunBusy(string initialStatus, Func<CancellationToken, string> operation, Action afterSuccess = null, bool quiet = false)
         {
-            if (_busy)
+            if (_busy || _isClosed || !IsLoaded)
             {
                 return;
             }
 
-            _cts = new CancellationTokenSource();
+            var localCts = new CancellationTokenSource();
+            CancellationToken ct = localCts.Token;
+            _cts = localCts;
             SetBusy(true, quiet ? null : initialStatus);
 
-            Task<string> task = Task.Run(operation);
+            Task<string> task = Task.Run(() => operation(ct));
 
             task.ContinueWith(t =>
             {
-                Dispatcher.Invoke(() =>
+                try
                 {
-                    SetBusy(false, null);
-
-                    if (t.IsFaulted)
+                    if (_isClosed)
                     {
-                        Exception ex = t.Exception?.GetBaseException() ?? new Exception("未知错误");
-                        if (ex is OperationCanceledException)
+                        return;
+                    }
+
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_isClosed || !IsLoaded)
                         {
-                            TxtDavStatus.Text = "操作已取消";
+                            return;
+                        }
+
+                        if (ReferenceEquals(_cts, localCts))
+                        {
+                            _cts = null;
+                        }
+
+                        SetBusy(false, null);
+
+                        if (t.IsFaulted || t.IsCanceled)
+                        {
+                            Exception ex = t.Exception?.GetBaseException()
+                                ?? (t.IsCanceled ? (Exception)new OperationCanceledException() : new Exception("未知错误"));
+
+                            if (ex is OperationCanceledException)
+                            {
+                                TxtDavStatus.Text = "操作已取消";
+                                return;
+                            }
+
+                            if (!quiet)
+                            {
+                                TxtDavStatus.Text = "操作失败";
+                            }
+
+                            MessageWindow.Show(this, ex.Message, "操作失败", MessageTone.Danger);
                             return;
                         }
 
                         if (!quiet)
                         {
-                            TxtDavStatus.Text = "操作失败";
+                            TxtDavStatus.Text = t.Result ?? string.Empty;
                         }
 
-                        MessageWindow.Show(this, ex.Message, "操作失败", Dialogs.MessageTone.Danger);
-                        return;
-                    }
-
-                    if (!quiet)
+                        afterSuccess?.Invoke();
+                    }));
+                }
+                finally
+                {
+                    if (ReferenceEquals(_cts, localCts))
                     {
-                        TxtDavStatus.Text = t.Result ?? string.Empty;
+                        _cts = null;
                     }
 
-                    afterSuccess?.Invoke();
-                });
+                    try
+                    {
+                        localCts.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
             }, TaskScheduler.Default);
+        }
+
+        private static void TryDeleteFileQuietly(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return;
+            }
+
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
 
         private void OnCancelOperation(object sender, RoutedEventArgs e)
@@ -669,6 +934,9 @@ namespace DataManager
             {
                 _cts?.Cancel();
                 TxtDavStatus.Text = "正在取消…";
+            }
+            catch (ObjectDisposedException)
+            {
             }
             catch (Exception)
             {
@@ -680,8 +948,8 @@ namespace DataManager
         {
             if (_busy)
             {
-                bool result = MessageWindow.Confirm(this, "有一个正在进行的网络操作。\n\n确定要中止并关闭吗？",
-                    "操作进行中", Dialogs.MessageTone.Danger, Dialogs.MessageButtons.OkCancel);
+                bool result = MessageWindow.Confirm(this, "有一个正在进行的后台操作。\n\n确定要中止并关闭吗？",
+                    "操作进行中", MessageTone.Danger, MessageButtons.OkCancel);
 
                 if (!result)
                 {
@@ -693,12 +961,33 @@ namespace DataManager
                 {
                     _cts?.Cancel();
                 }
+                catch (ObjectDisposedException)
+                {
+                }
                 catch (Exception)
                 {
                 }
             }
 
             base.OnClosing(e);
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            _isClosed = true;
+
+            try
+            {
+                _cts?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (Exception)
+            {
+            }
+
+            base.OnClosed(e);
         }
 
         private void OnClose(object sender, RoutedEventArgs e)

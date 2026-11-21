@@ -9,6 +9,7 @@
         MinHeight="540"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <Grid>
@@ -182,9 +183,19 @@
                                         </DataGridTemplateColumn.CellTemplate>
                                     </DataGridTemplateColumn>
 
-                                    <DataGridTextColumn Header="排序优先级"
-                                                        Binding="{Binding SortPriorityText, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
-                                                        Width="80" />
+                                    <DataGridTemplateColumn Header="排序优先级" Width="80">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBox Text="{Binding SortPriorityText, Mode=TwoWay, UpdateSourceTrigger=LostFocus}"
+                                                         IsEnabled="{Binding IsSort}"
+                                                         Margin="4,2"
+                                                         MinHeight="24"
+                                                         Padding="4,1"
+                                                         HorizontalContentAlignment="Center"
+                                                         VerticalContentAlignment="Center" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
 
                                     <DataGridTemplateColumn Header="排序调整" Width="112">
                                         <DataGridTemplateColumn.CellTemplate>

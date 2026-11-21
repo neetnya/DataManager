@@ -8,6 +8,7 @@
         MinHeight="400"
         WindowStartupLocation="CenterOwner"
         ShowInTaskbar="False"
+        UseLayoutRounding="True"
         Background="{StaticResource WindowBackgroundBrush}"
         FontFamily="{StaticResource UiFont}">
     <Grid Margin="18">
@@ -36,13 +37,15 @@
         <!-- 新增标签 -->
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
             <TextBox x:Name="TxtNewTag" Width="220" MinHeight="30" />
-            <Button Content="添加"
+            <Button x:Name="BtnAddTag"
+                    Content="添加"
                     IsDefault="True"
                     MinWidth="72"
                     Margin="8,0,0,0"
                     Style="{StaticResource PrimaryButton}"
                     Click="OnAdd" />
-            <TextBlock Style="{StaticResource HintText}"
+            <TextBlock x:Name="TxtAddHint"
+                       Style="{StaticResource HintText}"
                        Margin="12,0,0,0"
                        VerticalAlignment="Center"
                        Text="回车即可添加" />
