@@ -368,6 +368,30 @@ CREATE TABLE IF NOT EXISTS meta_tag_link (
             _db.Execute("UPDATE meta_table SET name = ? WHERE id = ?", newName ?? string.Empty, tableId.ToString(CultureInfo.InvariantCulture));
         }
 
+        /// <summary>按给定顺序批量更新所有表的显示顺序（sort_order）。</summary>
+        public void ReorderTables(IList<long> orderedTableIds)
+        {
+            if (orderedTableIds == null || orderedTableIds.Count == 0)
+            {
+                return;
+            }
+
+            using (SqliteConnection.Tx tx = _db.Transaction())
+            {
+                for (int i = 0; i < orderedTableIds.Count; i++)
+                {
+                    using (SqliteStatement st = _db.Prepare("UPDATE meta_table SET sort_order = ? WHERE id = ?"))
+                    {
+                        st.Bind(1, i);
+                        st.Bind(2, orderedTableIds[i]);
+                        st.Step();
+                    }
+                }
+
+                tx.Complete();
+            }
+        }
+
         /// <summary>删除表：连同真实表、列、标签、标签绑定、行数据一起删除。</summary>
         public void DropTable(long tableId)
         {

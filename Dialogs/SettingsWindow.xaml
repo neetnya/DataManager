@@ -52,6 +52,23 @@
                             HorizontalAlignment="Stretch"
                             Click="OnNewTable"
                             Margin="0,0,0,6" />
+                    <Grid Margin="0,0,0,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="6" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="BtnTableUp"
+                                Grid.Column="0"
+                                Content="上移"
+                                HorizontalAlignment="Stretch"
+                                Click="OnTableMoveUp" />
+                        <Button x:Name="BtnTableDown"
+                                Grid.Column="2"
+                                Content="下移"
+                                HorizontalAlignment="Stretch"
+                                Click="OnTableMoveDown" />
+                    </Grid>
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />

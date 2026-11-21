@@ -707,6 +707,7 @@ namespace DataManager
             }
 
             _suppressSelection = false;
+            UpdateTableOrderButtons();
         }
 
         /// <summary>把界面上当前表的列改动写回工作副本。</summary>
@@ -748,6 +749,57 @@ namespace DataManager
 
             _currentTableId = (long)item.Tag;
             LoadColumns();
+            UpdateTableOrderButtons();
+        }
+
+        private void UpdateTableOrderButtons()
+        {
+            if (BtnTableUp == null || BtnTableDown == null)
+            {
+                return;
+            }
+
+            int idx = _currentTableId.HasValue
+                ? _work.FindIndex(t => t.Id == _currentTableId.Value)
+                : -1;
+
+            BtnTableUp.IsEnabled = idx > 0;
+            BtnTableDown.IsEnabled = idx >= 0 && idx < _work.Count - 1;
+        }
+
+        private void OnTableMoveUp(object sender, RoutedEventArgs e)
+        {
+            MoveCurrentTable(-1);
+        }
+
+        private void OnTableMoveDown(object sender, RoutedEventArgs e)
+        {
+            MoveCurrentTable(1);
+        }
+
+        private void MoveCurrentTable(int delta)
+        {
+            if (!_currentTableId.HasValue)
+            {
+                return;
+            }
+
+            int idx = _work.FindIndex(t => t.Id == _currentTableId.Value);
+            int target = idx + delta;
+            if (idx < 0 || target < 0 || target >= _work.Count)
+            {
+                return;
+            }
+
+            FlushCurrentColumns();
+
+            AppTable moving = _work[idx];
+            _work[idx] = _work[target];
+            _work[target] = moving;
+
+            MarkDirty();
+            RefreshTableList();
+            TableList.ScrollIntoView(TableList.SelectedItem);
         }
 
         private void LoadColumns()
@@ -1210,6 +1262,8 @@ namespace DataManager
 
                     Data.Schema.UpdateColumns(table.Id, cols);
                 }
+
+                Data.Schema.ReorderTables(_work.Select(t => t.Id).ToList());
 
                 Data.Connection.Commit();
                 _transactionOpen = false;
